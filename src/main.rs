@@ -15,7 +15,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{telegram, cache_maintenance, blockhash_processor::BlockhashProcessor},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor},
     core::token,
 };
 use solana_program_pack::Pack;
@@ -440,11 +440,7 @@ async fn main() {
         }
     }
 
-    // Initialize Telegram bot
-    match telegram::init().await {
-        Ok(_) => println!("Telegram bot initialized successfully"),
-        Err(e) => println!("Failed to initialize Telegram bot: {}. Continuing without notifications.", e),
-    }
+
     
     // Initialize token account list
     initialize_token_account_list(&config).await;
@@ -534,10 +530,5 @@ async fn main() {
     // Start the copy trading bot
     if let Err(e) = start_copy_trading(copy_trading_config).await {
         eprintln!("Copy trading error: {}", e);
-        
-        // Send error notification via Telegram
-        if let Err(te) = telegram::send_error_notification(&format!("Copy trading bot crashed: {}", e)).await {
-            eprintln!("Failed to send Telegram notification: {}", te);
-        }
     }
 }

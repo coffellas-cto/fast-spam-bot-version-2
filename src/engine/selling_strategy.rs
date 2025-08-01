@@ -96,16 +96,6 @@ impl SimpleSellingEngine {
                                 // Track the bought token
                                 self.track_bought_token(trade_info, &signature.to_string(), "PumpFun").await?;
                                 
-                                // Send notification
-                                if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                    trade_info,
-                                    &signature.to_string(),
-                                    "PumpFun",
-                                    "BUYING"
-                                ).await {
-                                    self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                }
-                                
                                 Ok(())
                             },
                             Err(e) => {
@@ -169,16 +159,6 @@ impl SimpleSellingEngine {
                                     
                                     // Track the bought token
                                     self.track_bought_token(trade_info, &signature.to_string(), "PumpSwap").await?;
-                                    
-                                    // Send notification
-                                    if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                        trade_info,
-                                        &signature.to_string(),
-                                        "PumpSwap",
-                                        "BUYING"
-                                    ).await {
-                                        self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                    }
                                     
                                     return Ok(());
                                 },
@@ -333,16 +313,6 @@ impl SimpleSellingEngine {
                                 BOUGHT_TOKENS.remove_token(&trade_info.mint);
                                 self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
                                 
-                                // Send notification
-                                if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                    trade_info,
-                                    &signature.to_string(),
-                                    "PumpFun",
-                                    "SELLING"
-                                ).await {
-                                    self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                }
-                                
                                 Ok(())
                             },
                             Err(e) => {
@@ -398,16 +368,6 @@ impl SimpleSellingEngine {
                                 // Remove token from tracking after successful sell
                                 BOUGHT_TOKENS.remove_token(&trade_info.mint);
                                 self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
-                                
-                                // Send notification
-                                if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                    trade_info,
-                                    &signature.to_string(),
-                                    "PumpSwap",
-                                    "SELLING"
-                                ).await {
-                                    self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                }
                                 
                                 Ok(())
                             },

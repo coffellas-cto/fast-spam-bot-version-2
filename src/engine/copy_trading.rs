@@ -385,24 +385,9 @@ async fn handle_parsed_data(
                 let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
                 logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
                 
-                // Send notification
-                if let Err(e) = crate::services::telegram::send_trade_notification(
-                    &parsed_data,
-                    &format!("{:?}", protocol),
-                    "BUYING"
-                ).await {
-                    logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                }
             },
             Err(e) => {
                 logger.log(format!("Failed to execute BUY for token {}: {}", mint, e).red().to_string());
-                
-                // Send error notification
-                if let Err(te) = crate::services::telegram::send_error_notification(
-                    &format!("Buy error for {}: {}", mint, e)
-                ).await {
-                    logger.log(format!("Failed to send Telegram notification: {}", te).red().to_string());
-                }
                 
                 return Err(format!("Failed to execute buy: {}", e));
             }
@@ -435,24 +420,9 @@ async fn handle_parsed_data(
                     let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
                     logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
                     
-                    // Send notification
-                    if let Err(e) = crate::services::telegram::send_trade_notification(
-                        &parsed_data,
-                        &format!("{:?}", protocol),
-                        "SELLING"
-                    ).await {
-                        logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                    }
                 },
                 Err(e) => {
                     logger.log(format!("Failed to execute SELL for token {}: {}", mint, e).red().to_string());
-                    
-                    // Send error notification
-                    if let Err(te) = crate::services::telegram::send_error_notification(
-                        &format!("Sell error for {}: {}", mint, e)
-                    ).await {
-                        logger.log(format!("Failed to send Telegram notification: {}", te).red().to_string());
-                    }
                     
                     return Err(format!("Failed to execute sell: {}", e));
                 }
