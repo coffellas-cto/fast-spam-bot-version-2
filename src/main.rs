@@ -104,21 +104,25 @@ async fn wrap_sol(config: &Config, amount: f64) -> Result<(), String> {
         ).map_err(|e| format!("Failed to create sync native instruction: {}", e))?
     );
     
-    // Send transaction
+    // Send transaction using transaction landing mode
     let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
         .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
     
-    let transaction = Transaction::new_signed_with_payer(
-        &instructions,
-        Some(&wallet_pubkey),
-        &[&config.app_state.wallet],
+    match crate::core::tx::new_signed_and_send_with_landing_mode(
+        config.transaction_landing_mode.clone(),
+        &config.app_state,
         recent_blockhash,
-    );
-    
-    match config.app_state.rpc_client.send_and_confirm_transaction(&transaction) {
-        Ok(signature) => {
-            logger.log(format!("SOL wrapped successfully, signature: {}", signature));
-            Ok(())
+        &config.app_state.wallet,
+        instructions,
+        &logger,
+    ).await {
+        Ok(signatures) => {
+            if !signatures.is_empty() {
+                logger.log(format!("SOL wrapped successfully, signature: {}", signatures[0]));
+                Ok(())
+            } else {
+                Err("No transaction signature returned".to_string())
+            }
         },
         Err(e) => {
             Err(format!("Failed to wrap SOL: {}", e))
@@ -163,21 +167,25 @@ async fn unwrap_sol(config: &Config) -> Result<(), String> {
         &[&wallet_pubkey],
     ).map_err(|e| format!("Failed to create close account instruction: {}", e))?;
     
-    // Send transaction
+    // Send transaction using transaction landing mode
     let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
         .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
     
-    let transaction = Transaction::new_signed_with_payer(
-        &[close_instruction],
-        Some(&wallet_pubkey),
-        &[&config.app_state.wallet],
+    match crate::core::tx::new_signed_and_send_with_landing_mode(
+        config.transaction_landing_mode.clone(),
+        &config.app_state,
         recent_blockhash,
-    );
-    
-    match config.app_state.rpc_client.send_and_confirm_transaction(&transaction) {
-        Ok(signature) => {
-            logger.log(format!("WSOL unwrapped successfully, signature: {}", signature));
-            Ok(())
+        &config.app_state.wallet,
+        vec![close_instruction],
+        &logger,
+    ).await {
+        Ok(signatures) => {
+            if !signatures.is_empty() {
+                logger.log(format!("WSOL unwrapped successfully, signature: {}", signatures[0]));
+                Ok(())
+            } else {
+                Err("No transaction signature returned".to_string())
+            }
         },
         Err(e) => {
             Err(format!("Failed to unwrap WSOL: {}", e))
@@ -248,21 +256,26 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
             &[&wallet_pubkey],
         ).map_err(|e| format!("Failed to create close instruction for {}: {}", token_account, e))?;
         
-        // Send transaction
+        // Send transaction using transaction landing mode
         let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
             .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
         
-        let transaction = Transaction::new_signed_with_payer(
-            &[close_instruction],
-            Some(&wallet_pubkey),
-            &[&config.app_state.wallet],
+        match crate::core::tx::new_signed_and_send_with_landing_mode(
+            config.transaction_landing_mode.clone(),
+            &config.app_state,
             recent_blockhash,
-        );
-        
-        match config.app_state.rpc_client.send_and_confirm_transaction(&transaction) {
-            Ok(signature) => {
-                logger.log(format!("Closed token account {}, signature: {}", token_account, signature));
-                closed_count += 1;
+            &config.app_state.wallet,
+            vec![close_instruction],
+            &logger,
+        ).await {
+            Ok(signatures) => {
+                if !signatures.is_empty() {
+                    logger.log(format!("Closed token account {}, signature: {}", token_account, signatures[0]));
+                    closed_count += 1;
+                } else {
+                    logger.log(format!("Failed to close token account {}: No signature returned", token_account).red().to_string());
+                    failed_count += 1;
+                }
             },
             Err(e) => {
                 logger.log(format!("Failed to close token account {}: {}", token_account, e).red().to_string());
@@ -511,10 +524,11 @@ async fn main() {
         excluded_addresses,
         protocol_preference,
         is_progressive_sell: config.is_progressive_sell,
-        is_copy_selling: config.is_copy_selling,
-        is_reverse: config.is_reverse,
-        min_dev_buy: config.min_dev_buy,
-        max_dev_buy: config.max_dev_buy,
+        is_copy_selling: false, // Default value since this field is not in Config
+        is_reverse: false, // Default value since this field is not in Config
+        min_dev_buy: 0.001, // Default value since this field is not in Config
+        max_dev_buy: 0.1, // Default value since this field is not in Config
+        transaction_landing_mode: config.transaction_landing_mode.clone(),
     };
     
     // Start the copy trading bot

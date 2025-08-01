@@ -25,7 +25,7 @@ pub enum TransactionLandingMode {
 
 impl Default for TransactionLandingMode {
     fn default() -> Self {
-        TransactionLandingMode::Normal
+        TransactionLandingMode::Zeroslot
     }
 }
 

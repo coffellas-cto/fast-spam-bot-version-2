@@ -20,6 +20,7 @@ use solana_sdk::signature::Signer;
 pub struct SimpleSellingEngine {
     app_state: Arc<AppState>,
     swap_config: Arc<SwapConfig>,
+    transaction_landing_mode: crate::common::config::TransactionLandingMode,
     logger: Logger,
 }
 
@@ -27,10 +28,12 @@ impl SimpleSellingEngine {
     pub fn new(
         app_state: Arc<AppState>,
         swap_config: Arc<SwapConfig>,
+        transaction_landing_mode: crate::common::config::TransactionLandingMode,
     ) -> Self {
         Self {
             app_state,
             swap_config,
+            transaction_landing_mode,
             logger: Logger::new("[SIMPLE-SELLING] => ".yellow().to_string()),
         }
     }
@@ -73,9 +76,10 @@ impl SimpleSellingEngine {
                             }
                         };
                         
-                        // Execute with Nozomi
-                        match crate::core::tx::new_signed_and_send(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -146,9 +150,10 @@ impl SimpleSellingEngine {
                                 }
                             };
                             
-                            // Execute with Nozomi
-                            match crate::core::tx::new_signed_and_send(
-                                self.app_state.rpc_nonblocking_client.clone(),
+                            // Execute with transaction landing mode
+                            match crate::core::tx::new_signed_and_send_with_landing_mode(
+                                self.transaction_landing_mode.clone(),
+                                &self.app_state,
                                 recent_blockhash,
                                 &keypair,
                                 instructions,
@@ -307,9 +312,10 @@ impl SimpleSellingEngine {
                         };
                         self.logger.log(format!("Generated PumpFun sell instruction at price: {}", price));
                         
-                        // Execute with Nozomi
-                        match crate::core::tx::new_signed_and_send(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -372,9 +378,10 @@ impl SimpleSellingEngine {
                         };
                         self.logger.log(format!("Generated PumpSwap sell instruction at price: {}", price));
                         
-                        // Execute with Nozomi
-                        match crate::core::tx::new_signed_and_send(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
                             recent_blockhash,
                             &keypair,
                             instructions,

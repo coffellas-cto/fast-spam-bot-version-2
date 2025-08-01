@@ -83,6 +83,7 @@ pub struct CopyTradingConfig {
     pub is_reverse: bool,
     pub min_dev_buy: f64,
     pub max_dev_buy: f64,
+    pub transaction_landing_mode: crate::common::config::TransactionLandingMode,
 }
 
 /// Helper to send heartbeat pings to maintain connection
@@ -225,6 +226,7 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     let selling_engine = SimpleSellingEngine::new(
         Arc::new(config.app_state.clone()),
         Arc::new(config.swap_config.clone()),
+        config.transaction_landing_mode.clone(),
     );
 
     // Process incoming messages
