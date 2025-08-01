@@ -6,14 +6,42 @@ use reqwest::Error;
 use serde::Deserialize;
 use anchor_client::solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair, signer::Signer};
 use tokio::sync::{Mutex, OnceCell};
+use tokio_tungstenite::tungstenite::http::request;
 use std::{env, sync::Arc};
 use crate::engine::swap::SwapProtocol;
 use crate::{
     common::{constants::INIT_MSG, logger::Logger},
     engine::swap::{SwapDirection, SwapInType},
 };
+use std::time::Duration;
 
 static GLOBAL_CONFIG: OnceCell<Mutex<Config>> = OnceCell::const_new();
+
+#[derive(Clone, Debug)]
+pub enum TransactionLandingMode {
+    Zeroslot,
+    Normal,
+}
+
+impl Default for TransactionLandingMode {
+    fn default() -> Self {
+        TransactionLandingMode::Normal
+    }
+}
+
+impl FromStr for TransactionLandingMode {
+    type Err = String;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "0" | "zeroslot" => Ok(TransactionLandingMode::Zeroslot),
+            "1" | "normal" => Ok(TransactionLandingMode::Normal),
+            _ => Err(format!("Invalid transaction landing mode: {}. Use 'zeroslot' or 'normal'", s)),
+        }
+    }
+}
+
+use std::str::FromStr;
 
 pub struct Config {
     pub yellowstone_grpc_http: String,
@@ -22,10 +50,8 @@ pub struct Config {
     pub swap_config: SwapConfig,
     pub counter_limit: u32,
     pub is_progressive_sell: bool,
-    pub is_copy_selling: bool,
-    pub is_reverse: bool,
-    pub min_dev_buy: f64,
-    pub max_dev_buy: f64,
+    pub transaction_landing_mode: TransactionLandingMode,
+    pub copy_selling_limit: f64, // Add this field
 }
 
 impl Config {
@@ -44,10 +70,11 @@ impl Config {
             let slippage_input = import_env_var("SLIPPAGE").parse::<u64>().unwrap_or(5000);
             let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(0_u32);
             let is_progressive_sell = import_env_var("IS_PROGRESSIVE_SELL").parse::<bool>().unwrap_or(false);
-            let is_copy_selling = import_env_var("IS_COPY_SELLING").parse::<bool>().unwrap_or(false);
-            let is_reverse = import_env_var("IS_REVERSE").parse::<bool>().unwrap_or(false);
-            let min_dev_buy = import_env_var("MIN_DEV_BUY").parse::<f64>().unwrap_or(0.0);
-            let max_dev_buy = import_env_var("MAX_DEV_BUY").parse::<f64>().unwrap_or(1.0);
+            let transaction_landing_mode = import_env_var("TRANSACTION_LANDING_SERVICE")
+                .parse::<TransactionLandingMode>()
+                .unwrap_or(TransactionLandingMode::default());
+            // Read COPY_SELLING_LIMIT from env (default 1.5)
+            let copy_selling_limit = import_env_var("COPY_SELLING_LIMIT").parse::<f64>().unwrap_or(1.5);
             let max_slippage: u64 = 10000 ; 
             let slippage = if slippage_input > max_slippage {
                 max_slippage
@@ -57,7 +84,7 @@ impl Config {
             let solana_price = create_coingecko_proxy().await.unwrap_or(200_f64);
             let rpc_client = create_rpc_client().unwrap();
             let rpc_nonblocking_client = create_nonblocking_rpc_client().await.unwrap();
-            let nozomi_rpc_client = create_nozomi_nonblocking_rpc_client().await.unwrap();
+            let zeroslot_rpc_client = create_zeroslot_rpc_client().await.unwrap();
             let wallet: std::sync::Arc<anchor_client::solana_sdk::signature::Keypair> = import_wallet().unwrap();
             let balance = match rpc_nonblocking_client
                 .get_account(&wallet.pubkey())
@@ -83,13 +110,12 @@ impl Config {
                 in_type,
                 amount_in,
                 slippage,
-                max_buy_amount: amount_in.min(0.1), // Limit to 0.1 SOL or the configured amount, whichever is smaller
             };
 
             let app_state = AppState {
                 rpc_client,
                 rpc_nonblocking_client,
-                nozomi_rpc_client,
+                zeroslot_rpc_client,
                 wallet,
                 protocol_preference: SwapProtocol::default(),
             };
@@ -116,10 +142,8 @@ impl Config {
                 swap_config,
                 counter_limit,
                 is_progressive_sell,
-                is_copy_selling,
-                is_reverse,
-                min_dev_buy,
-                max_dev_buy,
+                transaction_landing_mode,
+                copy_selling_limit, // Set the field
             })
         })
         .await
@@ -209,7 +233,7 @@ struct SolanaData {
 pub struct AppState {
     pub rpc_client: Arc<anchor_client::solana_client::rpc_client::RpcClient>,
     pub rpc_nonblocking_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
-    pub nozomi_rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    pub zeroslot_rpc_client: Arc<crate::services::zeroslot::ZeroSlotClient>,
     pub wallet: Arc<Keypair>,
     pub protocol_preference: SwapProtocol,
 }
@@ -220,7 +244,6 @@ pub struct SwapConfig {
     pub in_type: SwapInType,
     pub amount_in: f64,
     pub slippage: u64,
-    pub max_buy_amount: f64, // Maximum amount to buy in a single transaction
 }
 
 pub fn import_env_var(key: &str) -> String {
@@ -233,32 +256,42 @@ pub fn import_env_var(key: &str) -> String {
     }
 }
 
+// Zero slot health check URL
+pub fn get_zero_slot_health_url() -> String {
+    std::env::var("ZERO_SLOT_HEALTH").unwrap_or_else(|_| {
+        eprintln!("ZERO_SLOT_HEALTH environment variable not set, using default");
+        "https://ny1.0slot.trade/health".to_string()
+    })
+}
+
 pub fn create_rpc_client() -> Result<Arc<anchor_client::solana_client::rpc_client::RpcClient>> {
     let rpc_http = import_env_var("RPC_HTTP");
-    let rpc_client = anchor_client::solana_client::rpc_client::RpcClient::new_with_commitment(
+    let timeout = Duration::from_secs(30); // 30 second timeout
+    let rpc_client = anchor_client::solana_client::rpc_client::RpcClient::new_with_timeout_and_commitment(
         rpc_http,
-        CommitmentConfig::processed(),
-    );
-    Ok(Arc::new(rpc_client))
-}
-pub async fn create_nonblocking_rpc_client(
-) -> Result<Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>> {
-    let rpc_http = import_env_var("RPC_HTTP");
-    let rpc_client = anchor_client::solana_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
-        rpc_http,
+        timeout,
         CommitmentConfig::processed(),
     );
     Ok(Arc::new(rpc_client))
 }
 
-pub async fn create_nozomi_nonblocking_rpc_client(
+pub async fn create_nonblocking_rpc_client(
 ) -> Result<Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>> {
-    let rpc_http = import_env_var("NOZOMI_URL");
-    let rpc_client = anchor_client::solana_client::nonblocking::rpc_client::RpcClient::new_with_commitment(
+    let rpc_http = import_env_var("RPC_HTTP");
+    let timeout = Duration::from_secs(30); // 30 second timeout
+    let rpc_client = anchor_client::solana_client::nonblocking::rpc_client::RpcClient::new_with_timeout_and_commitment(
         rpc_http,
+        timeout,
         CommitmentConfig::processed(),
     );
     Ok(Arc::new(rpc_client))
+}
+
+pub async fn create_zeroslot_rpc_client() -> Result<Arc<crate::services::zeroslot::ZeroSlotClient>> {
+    let client = crate::services::zeroslot::ZeroSlotClient::new(
+        crate::services::zeroslot::ZERO_SLOT_URL.as_str()
+    );
+    Ok(Arc::new(client))
 }
 
 

@@ -44,7 +44,7 @@ pub const RENT_PROGRAM: &str = "SysvarRent111111111111111111111111111111111";
 pub const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 pub const PUMP_GLOBAL: &str = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf";
 pub const PUMP_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
-pub const PUMP_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+pub const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 // pub const PUMP_FUN_MINT_AUTHORITY: &str = "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM";
 pub const PUMP_EVENT_AUTHORITY: &str = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
 pub const PUMP_BUY_METHOD: u64 = 16927863322537952870;
@@ -87,25 +87,97 @@ impl Pump {
     }
 
     pub async fn get_token_price(&self, mint_str: &str) -> Result<f64> {
+        // For PumpFun, we'll use a fallback method since we don't have trade_info here
+        // This method is mainly used for standalone price queries
         let mint = Pubkey::from_str(mint_str).map_err(|_| anyhow!("Invalid mint address"))?;
-        let pump_program = Pubkey::from_str(PUMP_PROGRAM)?;
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
         
-        // Get the bonding curve account info
+        // Get the bonding curve account info as fallback
         let (_, _, bonding_curve_reserves) = get_bonding_curve_account(
             self.rpc_client.clone().unwrap(), 
             mint, 
             pump_program
         ).await?;
         
-        // Calculate price using the virtual reserves
+        // Calculate price using the virtual reserves with consistent scaling
         let virtual_sol_reserves = bonding_curve_reserves.virtual_sol_reserves as f64;
         let virtual_token_reserves = bonding_curve_reserves.virtual_token_reserves as f64;
         
-        // Price formula: virtual_sol_reserves / virtual_token_reserves
-        // Convert to a reasonable scale
-        let price = virtual_sol_reserves / virtual_token_reserves;
+        // Price formula: (virtual_sol_reserves * 1_000_000_000) / virtual_token_reserves
+        // This matches the scaling used in transaction_parser.rs for consistency
+        let price = if virtual_token_reserves > 0.0 {
+            (virtual_sol_reserves * 1_000_000_000.0) / virtual_token_reserves
+        } else {
+            0.0
+        };
         
         Ok(price)
+    }
+
+    /// Calculate token amount out for buy using virtual reserves
+    pub fn calculate_buy_token_amount(
+        sol_amount_in: u64,
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+    ) -> u64 {
+        if sol_amount_in == 0 || virtual_sol_reserves == 0 || virtual_token_reserves == 0 {
+            return 0;
+        }
+        
+        // PumpFun bonding curve formula for buy:
+        // tokens_out = (sol_in * virtual_token_reserves) / (virtual_sol_reserves + sol_in)
+        let sol_amount_in_u128 = sol_amount_in as u128;
+        let virtual_sol_reserves_u128 = virtual_sol_reserves as u128;
+        let virtual_token_reserves_u128 = virtual_token_reserves as u128;
+        
+        let numerator = sol_amount_in_u128.saturating_mul(virtual_token_reserves_u128);
+        let denominator = virtual_sol_reserves_u128.saturating_add(sol_amount_in_u128);
+        
+        if denominator == 0 {
+            return 0;
+        }
+        
+        numerator.checked_div(denominator).unwrap_or(0) as u64
+    }
+
+    /// Calculate SOL amount out for sell using virtual reserves
+    pub fn calculate_sell_sol_amount(
+        token_amount_in: u64,
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+    ) -> u64 {
+        if token_amount_in == 0 || virtual_sol_reserves == 0 || virtual_token_reserves == 0 {
+            return 0;
+        }
+        
+        // PumpFun bonding curve formula for sell:
+        // sol_out = (token_in * virtual_sol_reserves) / (virtual_token_reserves + token_in)
+        let token_amount_in_u128 = token_amount_in as u128;
+        let virtual_sol_reserves_u128 = virtual_sol_reserves as u128;
+        let virtual_token_reserves_u128 = virtual_token_reserves as u128;
+        
+        let numerator = token_amount_in_u128.saturating_mul(virtual_sol_reserves_u128);
+        let denominator = virtual_token_reserves_u128.saturating_add(token_amount_in_u128);
+        
+        if denominator == 0 {
+            return 0;
+        }
+        
+        numerator.checked_div(denominator).unwrap_or(0) as u64
+    }
+
+    /// Calculate price using virtual reserves with consistent scaling
+    pub fn calculate_price_from_virtual_reserves(
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+    ) -> f64 {
+        if virtual_token_reserves == 0 {
+            return 0.0;
+        }
+        
+        // Price = (virtual_sol_reserves * 1_000_000_000) / virtual_token_reserves  
+        // This matches the scaling used in transaction_parser.rs for consistency
+        ((virtual_sol_reserves as f64) * 1_000_000_000.0) / (virtual_token_reserves as f64)
     }
 
     // Update the build_swap_from_parsed_data method
@@ -120,7 +192,8 @@ impl Pump {
         
         // Basic validation - ensure we have a PumpFun transaction
         if trade_info.dex_type != crate::engine::transaction_parser::DexType::PumpFun {
-            return Err(anyhow!("Invalid transaction type, expected PumpFun"));
+            println!("Invalid transaction type, expected PumpFun ::{:?}", trade_info.dex_type);
+            // return Err(anyhow!("Invalid transaction type, expected PumpFun"));
         }
         
         // Extract the essential data
@@ -128,28 +201,28 @@ impl Pump {
         let owner = self.keypair.pubkey();
         let token_program_id = Pubkey::from_str(TOKEN_PROGRAM)?;
         let native_mint = spl_token::native_mint::ID;
-        let pump_program = Pubkey::from_str(PUMP_PROGRAM)?;
+        let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
 
-        // Get bonding curve info
-        let bonding_curve_info = if let Some(bonding_curve_info) = &trade_info.bonding_curve_info {
-            Ok(get_bonding_curve_account_by_calc(bonding_curve_info.clone(), Pubkey::from_str(mint_str)?))
-        } else {
-            // If we don't have bonding curve info from parsed data, fetch it
-            _logger.log("No bonding curve info in parsed data, fetching from RPC".to_string());
-            get_bonding_curve_account(self.rpc_client.clone().unwrap(), Pubkey::from_str(mint_str)?, pump_program).await
-        }?;
-
-        // Unwrap results
-        let (bonding_curve, associated_bonding_curve, _bonding_curve_reserves) = bonding_curve_info;
+        // Use trade_info.price directly instead of fetching bonding curve info
+        _logger.log("Using trade_info.price for calculations".to_string());
+        
+        // Get bonding curve account addresses (we still need these for the transaction)
+        let bonding_curve = get_pda(&Pubkey::from_str(mint_str)?, &pump_program)?;
+        let associated_bonding_curve = get_associated_token_address(&bonding_curve, &Pubkey::from_str(mint_str)?);
 
         // Determine if this is a buy or sell operation
         let (token_in, token_out, pump_method) = match swap_config.swap_direction {
             SwapDirection::Buy => (native_mint, Pubkey::from_str(mint_str)?, PUMP_BUY_METHOD),
             SwapDirection::Sell => (Pubkey::from_str(mint_str)?, native_mint, PUMP_SELL_METHOD),
         };
-        // Get virtual reserves from parsed data or use defaults
-        let virtual_sol_reserves = trade_info.virtual_sol_reserves.unwrap_or(INITIAL_VIRTUAL_SOL_RESERVES);
-        let virtual_token_reserves = trade_info.virtual_token_reserves.unwrap_or(INITIAL_VIRTUAL_TOKEN_RESERVES);
+        
+        // Calculate price using virtual reserves from trade_info
+        let price_in_sol = Self::calculate_price_from_virtual_reserves(
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        _logger.log(format!("Calculated price from virtual reserves: {} (scaled) -> {} SOL (Virtual SOL: {}, Virtual Tokens: {})", 
+            price_in_sol, price_in_sol / 1_000_000_000.0, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves));
         // Use slippage directly as basis points (already u64)
         let slippage_bps = swap_config.slippage;
         // Create instructions as needed
@@ -206,48 +279,21 @@ impl Pump {
         // Calculate token amount and threshold based on operation type and parsed data
         let (token_amount, sol_amount_threshold, input_accounts) = match swap_config.swap_direction {
             SwapDirection::Buy => {
-                // if is_use_copy_rate {
-                    // let sol_amount = if let Some(max_cost) = trade_info.max_sol_cost {
-                    //     max_cost // Use parsed value directly
-                    // } else {
-                    //     // Calculate from swap_config
-                    //     ui_amount_to_amount(swap_config.amount_in, spl_token::native_mint::DECIMALS)
-                    // let available_sol = sol_amount;
-                    // let available_sol_f64 = available_sol as f64;
-    
-                    // // Calculate using virtual reserves
-                    // let virtual_sol_reserves_f64 = virtual_sol_reserves as f64;
-                    // let virtual_token_reserves_f64 = virtual_token_reserves as f64;
-                    // // Calculate constant product k
-                    // let k_f64 = virtual_sol_reserves_f64 * virtual_token_reserves_f64;
-                    // // Calculate new virtual SOL amount
-                    // let new_virtual_sol_f64 = virtual_sol_reserves_f64 + available_sol_f64;
-                    // // Calculate new virtual token amount
-                    // let new_virtual_tokens_f64 = k_f64 / new_virtual_sol_f64;
-                    // // Calculate expected tokens out
-                    // let tokens_out_f64 = virtual_token_reserves_f64 - new_virtual_tokens_f64;
-                    // // Apply slippage and round down
-                    // let slippage_factor = 1.0 - (slippage_bps as f64 / 10000.0);
-                    // let tokens_with_slippage = tokens_out_f64 * slippage_factor;
-                    // // Use parsed base_amount_out if available, otherwise calculate
-                    // let min_token_output = if let Some(amount_out) = trade_info.base_amount_out {
-                    //     amount_out
-                    // } else {
-                    //     tokens_with_slippage.floor() as u64
-                    // };
-                    // };
-                // }
-                // Calculate expected token output using the virtual reserves
-                print!("slippage_bps:::: {:?}", slippage_bps);
                 let amount_specified = ui_amount_to_amount(swap_config.amount_in, spl_token::native_mint::DECIMALS);
-                let max_sol_cost = max_amount_with_slippage(amount_specified, slippage_bps);
-                let amount_result = u128::from(amount_specified)
-                    .checked_mul(virtual_token_reserves as u128)
-                    .expect("Failed to multiply amount_specified by virtual_token_reserves: overflow occurred.")
-                    .checked_div(virtual_sol_reserves as u128)
-                    .expect("Failed to divide the result by virtual_sol_reserves: division by zero or overflow occurred.");
+                let max_sol_cost = max_amount_with_slippage(amount_specified, 20000);
+                
+                // Use virtual reserves from trade_info for accurate calculation
+                let tokens_out = Self::calculate_buy_token_amount(
+                    amount_specified,
+                    trade_info.virtual_sol_reserves,
+                    trade_info.virtual_token_reserves,
+                );
+                
+                _logger.log(format!("Buy calculation - SOL in: {}, Tokens out: {}, Virtual SOL: {}, Virtual Tokens: {}", 
+                    amount_specified, tokens_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves));
+                
                 (
-                    amount_result as u64,
+                    tokens_out,
                     max_sol_cost,
                     vec![
                         AccountMeta::new_readonly(Pubkey::from_str(PUMP_GLOBAL)?, false),   
@@ -266,12 +312,8 @@ impl Pump {
                 )
             },
             SwapDirection::Sell => {
-                // Get token balance to sell - use trade_info.token_amount if available
-                //TODO: let amount = if let Some(token_amount) = trade_info.token_amount {
-                    //TODO:     token_amount
-                    //TODO: } else {
-                        // If not available in trade_info, get from account (fallback)
-                    let amount = {
+                // Get token balance to sell
+                let amount = {
                     let in_account = token::get_account_info(
                         self.rpc_nonblocking_client.clone(),
                         token_in,
@@ -298,7 +340,7 @@ impl Pump {
                             }
                         }
                     }
-                 };
+                };
                 
                 // Validate amount
                 if amount == 0 {
@@ -306,32 +348,18 @@ impl Pump {
                 }
                 
                 // Calculate expected SOL output using virtual reserves
-                let virtual_sol_reserves_f64 = virtual_sol_reserves as f64;
-                let virtual_token_reserves_f64 = virtual_token_reserves as f64;
-                let amount_f64 = amount as f64;
+                let expected_sol_out = Self::calculate_sell_sol_amount(
+                    amount,
+                    trade_info.virtual_sol_reserves,
+                    trade_info.virtual_token_reserves,
+                );
                 
-                // Calculate constant product k
-                let k_f64 = virtual_sol_reserves_f64 * virtual_token_reserves_f64;
-                
-                // Calculate new virtual token amount after sell
-                let new_virtual_tokens_f64 = virtual_token_reserves_f64 + amount_f64;
-                
-                // Calculate new virtual SOL amount
-                let new_virtual_sol_f64 = k_f64 / new_virtual_tokens_f64;
-                
-                // Calculate expected SOL out
-                let sol_out_f64 = virtual_sol_reserves_f64 - new_virtual_sol_f64;
-                
-                // Apply slippage and round down
+                // Apply slippage
                 let slippage_factor = 1.0 - (slippage_bps as f64 / 10000.0);
-                let sol_with_slippage = sol_out_f64 * slippage_factor;
+                let min_sol_output = (expected_sol_out as f64 * slippage_factor) as u64;
                 
-                // Use parsed min_sol_output if available, otherwise calculate
-                let min_sol_output = if let Some(output) = trade_info.min_sol_output {
-                    output
-                } else {
-                    sol_with_slippage.floor() as u64
-                };
+                _logger.log(format!("Sell calculation - Tokens in: {}, Expected SOL out: {}, Min SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}", 
+                    amount, expected_sol_out, min_sol_output, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves));
                 
                 // Return accounts for sell
                 (
@@ -379,10 +407,10 @@ impl Pump {
             return Err(anyhow!("Instructions is empty, no txn required."));
         }
         
-        // Calculate token price
-        let token_price = virtual_sol_reserves as f64 / virtual_token_reserves as f64;
+        // Use price from trade_info directly - convert back to unscaled for consistency with external usage
+        let token_price = price_in_sol / 1_000_000_000.0;
         println!("time taken for build_swap_from_parsed_data: {:?}", started_time.elapsed());
-        // Return the keypair, instructions, and the token price
+        // Return the keypair, instructions, and the token price (unscaled f64)
         Ok((self.keypair.clone(), instructions, token_price))
     }
 }
