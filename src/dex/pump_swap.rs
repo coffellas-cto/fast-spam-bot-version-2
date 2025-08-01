@@ -648,3 +648,31 @@ fn create_swap_instruction(
     Instruction { program_id, accounts, data }
 }
 
+/// Simple struct for caching PumpSwap pool information
+#[derive(Clone, Debug)]
+pub struct PumpSwapPool {
+    pub pool_id: Pubkey,
+    pub mint: Pubkey,
+    pub base_reserve: u64,
+    pub quote_reserve: u64,
+    pub price: f64,
+}
+
+impl PumpSwapPool {
+    pub fn new(pool_id: Pubkey, mint: Pubkey, base_reserve: u64, quote_reserve: u64) -> Self {
+        let price = if base_reserve > 0 {
+            quote_reserve as f64 / base_reserve as f64
+        } else {
+            0.0
+        };
+        
+        Self {
+            pool_id,
+            mint,
+            base_reserve,
+            quote_reserve,
+            price,
+        }
+    }
+}
+

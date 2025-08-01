@@ -46,11 +46,14 @@ impl SimpleSellingEngine {
         let mut buy_config = (*self.swap_config).clone();
         buy_config.swap_direction = SwapDirection::Buy;
         
+        // Define max buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
+        const MAX_BUY_AMOUNT: f64 = 1.0; // 1 SOL max buy amount
+        
         // Limit the buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
-        let limited_amount = trade_info.token_amount_f64.min(buy_config.max_buy_amount);
-        if limited_amount != trade_info.token_amount_f64 {
+        let limited_amount = trade_info.sol_change.abs().min(MAX_BUY_AMOUNT);
+        if limited_amount != trade_info.sol_change.abs() {
             self.logger.log(format!("Limited buy amount from {} to {} SOL (max_buy_amount)", 
-                trade_info.token_amount_f64, limited_amount).yellow().to_string());
+                trade_info.sol_change.abs(), limited_amount).yellow().to_string());
         }
         buy_config.amount_in = limited_amount;
 
