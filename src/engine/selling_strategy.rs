@@ -49,12 +49,16 @@ impl SimpleSellingEngine {
         // Define max buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
         const MAX_BUY_AMOUNT: f64 = 1.0; // 1 SOL max buy amount
         
-        // Limit the buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
-        let limited_amount = trade_info.sol_change.abs().min(MAX_BUY_AMOUNT);
-        if limited_amount != trade_info.sol_change.abs() {
+        // Use configured TOKEN_AMOUNT from .env file and apply safety limit
+        let configured_amount = buy_config.amount_in; // This contains TOKEN_AMOUNT from .env
+        let limited_amount = configured_amount.min(MAX_BUY_AMOUNT);
+        
+        if limited_amount != configured_amount {
             self.logger.log(format!("Limited buy amount from {} to {} SOL (max_buy_amount)", 
-                trade_info.sol_change.abs(), limited_amount).yellow().to_string());
+                configured_amount, limited_amount).yellow().to_string());
         }
+        
+        self.logger.log(format!("Using buy amount: {} SOL (from TOKEN_AMOUNT config)", limited_amount).green().to_string());
         buy_config.amount_in = limited_amount;
 
         // Execute buy based on protocol
