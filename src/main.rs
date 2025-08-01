@@ -20,7 +20,6 @@ use solana_vntr_sniper::{
 };
 use solana_program_pack::Pack;
 use anchor_client::solana_sdk::pubkey::Pubkey;
-use anchor_client::solana_sdk::transaction::Transaction;
 use anchor_client::solana_sdk::system_instruction;
 use std::str::FromStr;
 use colored::Colorize;
@@ -108,7 +107,7 @@ async fn wrap_sol(config: &Config, amount: f64) -> Result<(), String> {
     let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
         .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
     
-    match crate::core::tx::new_signed_and_send_with_landing_mode(
+    match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
         config.transaction_landing_mode.clone(),
         &config.app_state,
         recent_blockhash,
@@ -171,7 +170,7 @@ async fn unwrap_sol(config: &Config) -> Result<(), String> {
     let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
         .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
     
-    match crate::core::tx::new_signed_and_send_with_landing_mode(
+    match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
         config.transaction_landing_mode.clone(),
         &config.app_state,
         recent_blockhash,
@@ -260,7 +259,7 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
         let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
             .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
         
-        match crate::core::tx::new_signed_and_send_with_landing_mode(
+        match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
             config.transaction_landing_mode.clone(),
             &config.app_state,
             recent_blockhash,
