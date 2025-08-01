@@ -286,11 +286,11 @@ async fn process_message(
         };
         
         if !inner_instructions.is_empty() {
-            // Find inner instruction with data length of 368 or 233
+            // Find inner instruction with data length of 368, 270, 233, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
                 .iter()
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 233)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 233 || ix.data.len() == 146)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {
@@ -336,6 +336,7 @@ async fn handle_parsed_data(
         match instruction_type {
             transaction_parser::DexType::PumpSwap => "PumpSwap",
             transaction_parser::DexType::PumpFun => "PumpFun",
+            transaction_parser::DexType::RaydiumLaunchpad => "RaydiumLaunchpad",
             _ => "Unknown",
         },
         parsed_data.is_buy
@@ -345,6 +346,7 @@ async fn handle_parsed_data(
     let protocol = match instruction_type {
         transaction_parser::DexType::PumpSwap => SwapProtocol::PumpSwap,
         transaction_parser::DexType::PumpFun => SwapProtocol::PumpFun,
+        transaction_parser::DexType::RaydiumLaunchpad => SwapProtocol::RaydiumLaunchpad,
         _ => config.protocol_preference.clone(),
     };
     

@@ -68,7 +68,7 @@ impl Config {
             let yellowstone_grpc_http = import_env_var("YELLOWSTONE_GRPC_HTTP");
             let yellowstone_grpc_token = import_env_var("YELLOWSTONE_GRPC_TOKEN");
             let slippage_input = import_env_var("SLIPPAGE").parse::<u64>().unwrap_or(5000);
-            let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(0_u32);
+            let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(10_u32);
             let is_progressive_sell = import_env_var("IS_PROGRESSIVE_SELL").parse::<bool>().unwrap_or(false);
             let transaction_landing_mode = import_env_var("TRANSACTION_LANDING_SERVICE")
                 .parse::<TransactionLandingMode>()

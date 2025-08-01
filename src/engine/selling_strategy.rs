@@ -208,6 +208,60 @@ impl SimpleSellingEngine {
                 // If we get here, all attempts failed
                 Err(last_error.unwrap_or_else(|| anyhow!("All buy attempts failed")))
             },
+            SwapProtocol::RaydiumLaunchpad => {
+                let raydium = crate::dex::raydium_launchpad::Raydium::new(
+                    self.app_state.wallet.clone(),
+                    Some(self.app_state.rpc_client.clone()),
+                    Some(self.app_state.rpc_nonblocking_client.clone()),
+                );
+                
+                match raydium.build_swap_from_parsed_data(trade_info, buy_config).await {
+                    Ok((keypair, instructions, price)) => {
+                        self.logger.log(format!("Generated RaydiumLaunchpad buy instruction at price: {}", price));
+                        
+                        // Get recent blockhash
+                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+                            Some(hash) => hash,
+                            None => {
+                                self.logger.log("Failed to get recent blockhash".red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash"));
+                            }
+                        };
+                        
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
+                            recent_blockhash,
+                            &keypair,
+                            instructions,
+                            &self.logger,
+                        ).await {
+                            Ok(signatures) => {
+                                if signatures.is_empty() {
+                                    return Err(anyhow!("No transaction signature returned"));
+                                }
+                                
+                                let signature = &signatures[0];
+                                self.logger.log(format!("Buy transaction sent: {}", signature).green().to_string());
+                                
+                                // Track the bought token
+                                self.track_bought_token(trade_info, &signature.to_string(), "RaydiumLaunchpad").await?;
+                                
+                                Ok(())
+                            },
+                            Err(e) => {
+                                self.logger.log(format!("Buy transaction failed: {}", e).red().to_string());
+                                Err(anyhow!("Failed to send buy transaction: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to build RaydiumLaunchpad buy instruction: {}", e).red().to_string());
+                        Err(anyhow!("Failed to build buy instruction: {}", e))
+                    }
+                }
+            },
             _ => Err(anyhow!("Unsupported protocol")),
         };
         
@@ -386,6 +440,62 @@ impl SimpleSellingEngine {
                     }
                 }
             },
+            SwapProtocol::RaydiumLaunchpad => {
+                self.logger.log("Using RaydiumLaunchpad protocol for sell".red().to_string());
+                
+                let raydium = crate::dex::raydium_launchpad::Raydium::new(
+                    self.app_state.wallet.clone(),
+                    Some(self.app_state.rpc_client.clone()),
+                    Some(self.app_state.rpc_nonblocking_client.clone()),
+                );
+                
+                match raydium.build_swap_from_parsed_data(trade_info, sell_config).await {
+                    Ok((keypair, instructions, price)) => {
+                        // Get recent blockhash
+                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+                            Some(hash) => hash,
+                            None => {
+                                self.logger.log("Failed to get recent blockhash".red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash"));
+                            }
+                        };
+                        self.logger.log(format!("Generated RaydiumLaunchpad sell instruction at price: {}", price));
+                        
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
+                            recent_blockhash,
+                            &keypair,
+                            instructions,
+                            &self.logger,
+                        ).await {
+                            Ok(signatures) => {
+                                if signatures.is_empty() {
+                                    return Err(anyhow!("No transaction signature returned"));
+                                }
+                                
+                                let signature = &signatures[0];
+                                self.logger.log(format!("Sell transaction sent: {}", signature).green().to_string());
+                                
+                                // Remove token from tracking after successful sell
+                                BOUGHT_TOKENS.remove_token(&trade_info.mint);
+                                self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
+                                
+                                Ok(())
+                            },
+                            Err(e) => {
+                                self.logger.log(format!("Sell transaction failed: {}", e).red().to_string());
+                                Err(anyhow!("Failed to send sell transaction: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to build RaydiumLaunchpad sell instruction: {}", e).red().to_string());
+                        Err(anyhow!("Failed to build sell instruction: {}", e))
+                    }
+                }
+            },
             _ => {
                 return Err(anyhow!("Unsupported protocol for sell: {:?}", self.get_protocol_from_trade_info(trade_info)));
             }
@@ -430,6 +540,7 @@ impl SimpleSellingEngine {
         match trade_info.dex_type {
             DexType::PumpSwap => SwapProtocol::PumpSwap,
             DexType::PumpFun => SwapProtocol::PumpFun,
+            DexType::RaydiumLaunchpad => SwapProtocol::RaydiumLaunchpad,
             _ => self.app_state.protocol_preference.clone(),
         }
     }

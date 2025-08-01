@@ -504,6 +504,7 @@ async fn main() {
         .map(|p| match p.to_lowercase().as_str() {
             "pumpfun" => SwapProtocol::PumpFun,
             "pumpswap" => SwapProtocol::PumpSwap,
+            "raydium_launchpad" => SwapProtocol::RaydiumLaunchpad,
             _ => SwapProtocol::Auto,
         })
         .unwrap_or(SwapProtocol::Auto);
