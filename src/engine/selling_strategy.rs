@@ -415,7 +415,7 @@ impl SimpleSellingEngine {
         BOUGHT_TOKENS.add_bought_token(
             trade_info.mint.clone(),
             ata,
-            trade_info.token_amount_f64,
+            trade_info.token_change.abs(),
             signature.to_string(),
             protocol.to_string(),
         );
