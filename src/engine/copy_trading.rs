@@ -79,7 +79,6 @@ pub struct CopyTradingConfig {
     pub excluded_addresses: Vec<String>,
     pub protocol_preference: SwapProtocol,
     pub is_progressive_sell: bool,
-    pub is_copy_selling: bool,
     pub is_reverse: bool,
     pub min_dev_buy: f64,
     pub max_dev_buy: f64,
@@ -115,7 +114,6 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     logger.log("Initializing copy trading bot...".green().to_string());
     logger.log(format!("Target addresses: {:?}", config.target_addresses));
     logger.log(format!("Protocol preference: {:?}", config.protocol_preference));
-    logger.log(format!("Copy selling enabled: {}", config.is_copy_selling).cyan().to_string());
     logger.log(format!("Reverse mode enabled: {}", config.is_reverse).cyan().to_string());
     logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string());
     
@@ -395,42 +393,38 @@ async fn handle_parsed_data(
             }
         }
     } else {
-        // Target is selling - we should sell too (if copy selling is enabled)
-        if config.is_copy_selling {
-            logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
-            
-            // Always decrease counter when target sells, even if we don't own the token
-            // This maintains proper counter balance
-            if let Some(mut counter) = COUNTER.get_mut(&()) {
-                if *counter > 0 {
-                    *counter -= 1;
-                    logger.log(format!("Buy counter decreased to {}/{} (target sold)", *counter, config.counter_limit).cyan().to_string());
-                }
+        // Target is selling - we should sell too
+        logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
+        
+        // Always decrease counter when target sells, even if we don't own the token
+        // This maintains proper counter balance
+        if let Some(mut counter) = COUNTER.get_mut(&()) {
+            if *counter > 0 {
+                *counter -= 1;
+                logger.log(format!("Buy counter decreased to {}/{} (target sold)", *counter, config.counter_limit).cyan().to_string());
             }
-            
-            // Execute sell
-            match selling_engine.execute_sell(&parsed_data).await {
-                Ok(_) => {
-                    logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
-                    
-                    // Update sold counter
-                    if let Some(mut counter) = SOLD_TOKENS.get_mut(&()) {
-                        *counter += 1;
-                    }
-                    
-                    // Log token tracking status
-                    let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
-                    logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
-                    
-                },
-                Err(e) => {
-                    logger.log(format!("Failed to execute SELL for token {}: {}", mint, e).red().to_string());
-                    
-                    return Err(format!("Failed to execute sell: {}", e));
+        }
+        
+        // Execute sell
+        match selling_engine.execute_sell(&parsed_data).await {
+            Ok(_) => {
+                logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
+                
+                // Update sold counter
+                if let Some(mut counter) = SOLD_TOKENS.get_mut(&()) {
+                    *counter += 1;
                 }
+                
+                // Log token tracking status
+                let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
+                logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
+                
+            },
+            Err(e) => {
+                logger.log(format!("Failed to execute SELL for token {}: {}", mint, e).red().to_string());
+                
+                return Err(format!("Failed to execute sell: {}", e));
             }
-        } else {
-            logger.log("Copy selling is disabled, ignoring sell transaction".yellow().to_string());
         }
     }
     

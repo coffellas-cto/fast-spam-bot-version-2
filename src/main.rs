@@ -520,7 +520,6 @@ async fn main() {
         excluded_addresses,
         protocol_preference,
         is_progressive_sell: config.is_progressive_sell,
-        is_copy_selling: false, // Default value since this field is not in Config
         is_reverse: false, // Default value since this field is not in Config
         min_dev_buy: 0.001, // Default value since this field is not in Config
         max_dev_buy: 0.1, // Default value since this field is not in Config
