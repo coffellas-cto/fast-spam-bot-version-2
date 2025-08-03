@@ -79,10 +79,10 @@ pub struct CopyTradingConfig {
     pub excluded_addresses: Vec<String>,
     pub protocol_preference: SwapProtocol,
     pub is_progressive_sell: bool,
-    pub is_copy_selling: bool,
     pub is_reverse: bool,
     pub min_dev_buy: f64,
     pub max_dev_buy: f64,
+    pub transaction_landing_mode: crate::common::config::TransactionLandingMode,
 }
 
 /// Helper to send heartbeat pings to maintain connection
@@ -114,7 +114,6 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     logger.log("Initializing copy trading bot...".green().to_string());
     logger.log(format!("Target addresses: {:?}", config.target_addresses));
     logger.log(format!("Protocol preference: {:?}", config.protocol_preference));
-    logger.log(format!("Copy selling enabled: {}", config.is_copy_selling).cyan().to_string());
     logger.log(format!("Reverse mode enabled: {}", config.is_reverse).cyan().to_string());
     logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string());
     
@@ -225,6 +224,7 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     let selling_engine = SimpleSellingEngine::new(
         Arc::new(config.app_state.clone()),
         Arc::new(config.swap_config.clone()),
+        config.transaction_landing_mode.clone(),
     );
 
     // Process incoming messages
@@ -284,11 +284,11 @@ async fn process_message(
         };
         
         if !inner_instructions.is_empty() {
-            // Find inner instruction with data length of 368 or 233
+            // Find inner instruction with data length of 368, 270, 233, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
                 .iter()
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 233)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 233 || ix.data.len() == 146)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {
@@ -334,6 +334,7 @@ async fn handle_parsed_data(
         match instruction_type {
             transaction_parser::DexType::PumpSwap => "PumpSwap",
             transaction_parser::DexType::PumpFun => "PumpFun",
+            transaction_parser::DexType::RaydiumLaunchpad => "RaydiumLaunchpad",
             _ => "Unknown",
         },
         parsed_data.is_buy
@@ -343,6 +344,7 @@ async fn handle_parsed_data(
     let protocol = match instruction_type {
         transaction_parser::DexType::PumpSwap => SwapProtocol::PumpSwap,
         transaction_parser::DexType::PumpFun => SwapProtocol::PumpFun,
+        transaction_parser::DexType::RaydiumLaunchpad => SwapProtocol::RaydiumLaunchpad,
         _ => config.protocol_preference.clone(),
     };
     
@@ -383,80 +385,46 @@ async fn handle_parsed_data(
                 let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
                 logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
                 
-                // Send notification
-                if let Err(e) = crate::services::telegram::send_trade_notification(
-                    &parsed_data,
-                    &format!("{:?}", protocol),
-                    "BUYING"
-                ).await {
-                    logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                }
             },
             Err(e) => {
                 logger.log(format!("Failed to execute BUY for token {}: {}", mint, e).red().to_string());
-                
-                // Send error notification
-                if let Err(te) = crate::services::telegram::send_error_notification(
-                    &format!("Buy error for {}: {}", mint, e)
-                ).await {
-                    logger.log(format!("Failed to send Telegram notification: {}", te).red().to_string());
-                }
                 
                 return Err(format!("Failed to execute buy: {}", e));
             }
         }
     } else {
-        // Target is selling - we should sell too (if copy selling is enabled)
-        if config.is_copy_selling {
-            logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
-            
-            // Always decrease counter when target sells, even if we don't own the token
-            // This maintains proper counter balance
-            if let Some(mut counter) = COUNTER.get_mut(&()) {
-                if *counter > 0 {
-                    *counter -= 1;
-                    logger.log(format!("Buy counter decreased to {}/{} (target sold)", *counter, config.counter_limit).cyan().to_string());
-                }
+        // Target is selling - we should sell too
+        logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
+        
+        // Always decrease counter when target sells, even if we don't own the token
+        // This maintains proper counter balance
+        if let Some(mut counter) = COUNTER.get_mut(&()) {
+            if *counter > 0 {
+                *counter -= 1;
+                logger.log(format!("Buy counter decreased to {}/{} (target sold)", *counter, config.counter_limit).cyan().to_string());
             }
-            
-            // Execute sell
-            match selling_engine.execute_sell(&parsed_data).await {
-                Ok(_) => {
-                    logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
-                    
-                    // Update sold counter
-                    if let Some(mut counter) = SOLD_TOKENS.get_mut(&()) {
-                        *counter += 1;
-                    }
-                    
-                    // Log token tracking status
-                    let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
-                    logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
-                    
-                    // Send notification
-                    if let Err(e) = crate::services::telegram::send_trade_notification(
-                        &parsed_data,
-                        &format!("{:?}", protocol),
-                        "SELLING"
-                    ).await {
-                        logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                    }
-                },
-                Err(e) => {
-                    logger.log(format!("Failed to execute SELL for token {}: {}", mint, e).red().to_string());
-                    
-                    // Send error notification
-                    if let Err(te) = crate::services::telegram::send_error_notification(
-                        &format!("Sell error for {}: {}", mint, e)
-                    ).await {
-                        logger.log(format!("Failed to send Telegram notification: {}", te).red().to_string());
-                    }
-                    
-                    return Err(format!("Failed to execute sell: {}", e));
+        }
+        
+        // Execute sell
+        match selling_engine.execute_sell(&parsed_data).await {
+            Ok(_) => {
+                logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
+                
+                // Update sold counter
+                if let Some(mut counter) = SOLD_TOKENS.get_mut(&()) {
+                    *counter += 1;
                 }
+                
+                // Log token tracking status
+                let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
+                logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
+                
+            },
+            Err(e) => {
+                logger.log(format!("Failed to execute SELL for token {}: {}", mint, e).red().to_string());
+                
+                return Err(format!("Failed to execute sell: {}", e));
             }
-        } else {
-            logger.log("Copy selling is disabled, ignoring sell transaction".yellow().to_string());
         }
     }
     
