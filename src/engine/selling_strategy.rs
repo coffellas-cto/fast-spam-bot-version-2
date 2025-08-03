@@ -20,6 +20,7 @@ use solana_sdk::signature::Signer;
 pub struct SimpleSellingEngine {
     app_state: Arc<AppState>,
     swap_config: Arc<SwapConfig>,
+    transaction_landing_mode: crate::common::config::TransactionLandingMode,
     logger: Logger,
 }
 
@@ -27,10 +28,12 @@ impl SimpleSellingEngine {
     pub fn new(
         app_state: Arc<AppState>,
         swap_config: Arc<SwapConfig>,
+        transaction_landing_mode: crate::common::config::TransactionLandingMode,
     ) -> Self {
         Self {
             app_state,
             swap_config,
+            transaction_landing_mode,
             logger: Logger::new("[SIMPLE-SELLING] => ".yellow().to_string()),
         }
     }
@@ -43,12 +46,19 @@ impl SimpleSellingEngine {
         let mut buy_config = (*self.swap_config).clone();
         buy_config.swap_direction = SwapDirection::Buy;
         
-        // Limit the buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
-        let limited_amount = trade_info.token_amount_f64.min(buy_config.max_buy_amount);
-        if limited_amount != trade_info.token_amount_f64 {
+        // Define max buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
+        const MAX_BUY_AMOUNT: f64 = 1.0; // 1 SOL max buy amount
+        
+        // Use configured TOKEN_AMOUNT from .env file and apply safety limit
+        let configured_amount = buy_config.amount_in; // This contains TOKEN_AMOUNT from .env
+        let limited_amount = configured_amount.min(MAX_BUY_AMOUNT);
+        
+        if limited_amount != configured_amount {
             self.logger.log(format!("Limited buy amount from {} to {} SOL (max_buy_amount)", 
-                trade_info.token_amount_f64, limited_amount).yellow().to_string());
+                configured_amount, limited_amount).yellow().to_string());
         }
+        
+        self.logger.log(format!("Using buy amount: {} SOL (from TOKEN_AMOUNT config)", limited_amount).green().to_string());
         buy_config.amount_in = limited_amount;
 
         // Execute buy based on protocol
@@ -73,9 +83,10 @@ impl SimpleSellingEngine {
                             }
                         };
                         
-                        // Execute with Nozomi
-                        match crate::core::tx::new_signed_and_send(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -91,16 +102,6 @@ impl SimpleSellingEngine {
                                 
                                 // Track the bought token
                                 self.track_bought_token(trade_info, &signature.to_string(), "PumpFun").await?;
-                                
-                                // Send notification
-                                if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                    trade_info,
-                                    &signature.to_string(),
-                                    "PumpFun",
-                                    "BUYING"
-                                ).await {
-                                    self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                }
                                 
                                 Ok(())
                             },
@@ -146,9 +147,10 @@ impl SimpleSellingEngine {
                                 }
                             };
                             
-                            // Execute with Nozomi
-                            match crate::core::tx::new_signed_and_send(
-                                self.app_state.rpc_nonblocking_client.clone(),
+                            // Execute with transaction landing mode
+                            match crate::core::tx::new_signed_and_send_with_landing_mode(
+                                self.transaction_landing_mode.clone(),
+                                &self.app_state,
                                 recent_blockhash,
                                 &keypair,
                                 instructions,
@@ -164,16 +166,6 @@ impl SimpleSellingEngine {
                                     
                                     // Track the bought token
                                     self.track_bought_token(trade_info, &signature.to_string(), "PumpSwap").await?;
-                                    
-                                    // Send notification
-                                    if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                        trade_info,
-                                        &signature.to_string(),
-                                        "PumpSwap",
-                                        "BUYING"
-                                    ).await {
-                                        self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                    }
                                     
                                     return Ok(());
                                 },
@@ -219,6 +211,60 @@ impl SimpleSellingEngine {
                 
                 // If we get here, all attempts failed
                 Err(last_error.unwrap_or_else(|| anyhow!("All buy attempts failed")))
+            },
+            SwapProtocol::RaydiumLaunchpad => {
+                let raydium = crate::dex::raydium_launchpad::Raydium::new(
+                    self.app_state.wallet.clone(),
+                    Some(self.app_state.rpc_client.clone()),
+                    Some(self.app_state.rpc_nonblocking_client.clone()),
+                );
+                
+                match raydium.build_swap_from_parsed_data(trade_info, buy_config).await {
+                    Ok((keypair, instructions, price)) => {
+                        self.logger.log(format!("Generated RaydiumLaunchpad buy instruction at price: {}", price));
+                        
+                        // Get recent blockhash
+                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+                            Some(hash) => hash,
+                            None => {
+                                self.logger.log("Failed to get recent blockhash".red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash"));
+                            }
+                        };
+                        
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
+                            recent_blockhash,
+                            &keypair,
+                            instructions,
+                            &self.logger,
+                        ).await {
+                            Ok(signatures) => {
+                                if signatures.is_empty() {
+                                    return Err(anyhow!("No transaction signature returned"));
+                                }
+                                
+                                let signature = &signatures[0];
+                                self.logger.log(format!("Buy transaction sent: {}", signature).green().to_string());
+                                
+                                // Track the bought token
+                                self.track_bought_token(trade_info, &signature.to_string(), "RaydiumLaunchpad").await?;
+                                
+                                Ok(())
+                            },
+                            Err(e) => {
+                                self.logger.log(format!("Buy transaction failed: {}", e).red().to_string());
+                                Err(anyhow!("Failed to send buy transaction: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to build RaydiumLaunchpad buy instruction: {}", e).red().to_string());
+                        Err(anyhow!("Failed to build buy instruction: {}", e))
+                    }
+                }
             },
             _ => Err(anyhow!("Unsupported protocol")),
         };
@@ -307,9 +353,10 @@ impl SimpleSellingEngine {
                         };
                         self.logger.log(format!("Generated PumpFun sell instruction at price: {}", price));
                         
-                        // Execute with Nozomi
-                        match crate::core::tx::new_signed_and_send(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -326,16 +373,6 @@ impl SimpleSellingEngine {
                                 // Remove token from tracking after successful sell
                                 BOUGHT_TOKENS.remove_token(&trade_info.mint);
                                 self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
-                                
-                                // Send notification
-                                if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                    trade_info,
-                                    &signature.to_string(),
-                                    "PumpFun",
-                                    "SELLING"
-                                ).await {
-                                    self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                }
                                 
                                 Ok(())
                             },
@@ -372,9 +409,10 @@ impl SimpleSellingEngine {
                         };
                         self.logger.log(format!("Generated PumpSwap sell instruction at price: {}", price));
                         
-                        // Execute with Nozomi
-                        match crate::core::tx::new_signed_and_send(
-                            self.app_state.rpc_nonblocking_client.clone(),
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
                             recent_blockhash,
                             &keypair,
                             instructions,
@@ -392,16 +430,6 @@ impl SimpleSellingEngine {
                                 BOUGHT_TOKENS.remove_token(&trade_info.mint);
                                 self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
                                 
-                                // Send notification
-                                if let Err(e) = crate::services::telegram::send_copy_trade_notification(
-                                    trade_info,
-                                    &signature.to_string(),
-                                    "PumpSwap",
-                                    "SELLING"
-                                ).await {
-                                    self.logger.log(format!("Failed to send Telegram notification: {}", e).red().to_string());
-                                }
-                                
                                 Ok(())
                             },
                             Err(e) => {
@@ -412,6 +440,62 @@ impl SimpleSellingEngine {
                     },
                     Err(e) => {
                         self.logger.log(format!("Failed to build PumpSwap sell instruction: {}", e).red().to_string());
+                        Err(anyhow!("Failed to build sell instruction: {}", e))
+                    }
+                }
+            },
+            SwapProtocol::RaydiumLaunchpad => {
+                self.logger.log("Using RaydiumLaunchpad protocol for sell".red().to_string());
+                
+                let raydium = crate::dex::raydium_launchpad::Raydium::new(
+                    self.app_state.wallet.clone(),
+                    Some(self.app_state.rpc_client.clone()),
+                    Some(self.app_state.rpc_nonblocking_client.clone()),
+                );
+                
+                match raydium.build_swap_from_parsed_data(trade_info, sell_config).await {
+                    Ok((keypair, instructions, price)) => {
+                        // Get recent blockhash
+                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+                            Some(hash) => hash,
+                            None => {
+                                self.logger.log("Failed to get recent blockhash".red().to_string());
+                                return Err(anyhow!("Failed to get recent blockhash"));
+                            }
+                        };
+                        self.logger.log(format!("Generated RaydiumLaunchpad sell instruction at price: {}", price));
+                        
+                        // Execute with transaction landing mode
+                        match crate::core::tx::new_signed_and_send_with_landing_mode(
+                            self.transaction_landing_mode.clone(),
+                            &self.app_state,
+                            recent_blockhash,
+                            &keypair,
+                            instructions,
+                            &self.logger,
+                        ).await {
+                            Ok(signatures) => {
+                                if signatures.is_empty() {
+                                    return Err(anyhow!("No transaction signature returned"));
+                                }
+                                
+                                let signature = &signatures[0];
+                                self.logger.log(format!("Sell transaction sent: {}", signature).green().to_string());
+                                
+                                // Remove token from tracking after successful sell
+                                BOUGHT_TOKENS.remove_token(&trade_info.mint);
+                                self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
+                                
+                                Ok(())
+                            },
+                            Err(e) => {
+                                self.logger.log(format!("Sell transaction failed: {}", e).red().to_string());
+                                Err(anyhow!("Failed to send sell transaction: {}", e))
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to build RaydiumLaunchpad sell instruction: {}", e).red().to_string());
                         Err(anyhow!("Failed to build sell instruction: {}", e))
                     }
                 }
@@ -445,7 +529,7 @@ impl SimpleSellingEngine {
         BOUGHT_TOKENS.add_bought_token(
             trade_info.mint.clone(),
             ata,
-            trade_info.token_amount_f64,
+            trade_info.token_change.abs(),
             signature.to_string(),
             protocol.to_string(),
         );
@@ -460,6 +544,7 @@ impl SimpleSellingEngine {
         match trade_info.dex_type {
             DexType::PumpSwap => SwapProtocol::PumpSwap,
             DexType::PumpFun => SwapProtocol::PumpFun,
+            DexType::RaydiumLaunchpad => SwapProtocol::RaydiumLaunchpad,
             _ => self.app_state.protocol_preference.clone(),
         }
     }

@@ -33,6 +33,8 @@ pub enum SwapProtocol {
     PumpFun,
     #[serde(rename = "pumpswap")]
     PumpSwap,
+    #[serde(rename = "raydium_launchpad")]
+    RaydiumLaunchpad,
     #[serde(rename = "auto")]
     Auto,
     #[serde(rename = "unknown")]

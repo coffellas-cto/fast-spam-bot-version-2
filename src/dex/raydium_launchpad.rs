@@ -201,7 +201,7 @@ impl Raydium {
         // For Raydium Launchpad:
         // - Buy: amount_in is SOL amount (convert to lamports)
         // - Sell: amount_in is token amount (convert to token units with proper decimals)
-        let base_amount = match swap_config.swap_direction {
+        let amount_in = match swap_config.swap_direction {
             SwapDirection::Buy => {
                 // For buy: amount_in is SOL amount, convert to lamports
                 ui_amount_to_amount(swap_config.amount_in, 9)
@@ -209,28 +209,14 @@ impl Raydium {
             SwapDirection::Sell => {
                 // For sell: amount_in is token amount, need to get token decimals
                 // First try to get from cache, then fallback to RPC with timeout
-                let decimals = if let Some(cached_mint) = crate::common::cache::TOKEN_MINT_CACHE.get(&mint) {
-                    cached_mint.base.decimals
-                } else if let Some(client) = &self.rpc_nonblocking_client {
-                    // Add timeout wrapper for RPC call
-                    let timeout_duration = std::time::Duration::from_secs(5); // 5 second timeout for mint info
-                    match tokio::time::timeout(timeout_duration, token::get_mint_info(client.clone(), self.keypair.clone(), mint)).await {
-                        Ok(Ok(mint_info)) => mint_info.base.decimals,
-                        Ok(Err(_)) => 6, // Default to 6 decimals
-                        Err(_) => 6, // Default to 6 decimals on timeout
-                    }
-                } else {
-                    // Fallback: assume 6 decimals for tokens (common default)
-                    6
-                };
-                
+                let decimals = 6; // all tokens are 6 decimals
                 // Convert token amount to token units (with decimals)
                 ui_amount_to_amount(swap_config.amount_in, decimals)
             }
         };
         
         // Calculate the actual quote amount using virtual reserves from trade_info
-        let quote_amount: u64 = 1; // to ignore slippage
+        let minimum_amount_out: u64 = 1; // to ignore slippage
         
         // Create accounts based on swap direction
         let accounts = match swap_config.swap_direction {
@@ -269,8 +255,8 @@ impl Raydium {
         instructions.push(create_swap_instruction(
             *RAYDIUM_LAUNCHPAD_PROGRAM,
             discriminator,
-            base_amount,
-            quote_amount,
+            amount_in,
+            minimum_amount_out,
             accounts,
         ));
         
@@ -430,41 +416,6 @@ fn create_sell_accounts(
 ])
 }
 
-// Raydium Launchpad specific calculation functions using virtual and real reserves
-#[inline]
-fn calculate_raydium_buy_amount_out(
-    quote_amount_in: u64, 
-    virtual_quote_reserve: u64, 
-    virtual_base_reserve: u64,
-    real_quote_reserve: u64,
-    real_base_reserve: u64
-) -> u64 {
-    if quote_amount_in == 0 || virtual_base_reserve == 0 || virtual_quote_reserve == 0 {
-        return 0;
-    }
-    
-    // Raydium Launchpad constant product formula:
-    // input_reserve = virtual_quote + real_quote
-    // output_reserve = virtual_base - real_base
-    // amount_out = (amount_in * output_reserve) / (input_reserve + amount_in)
-    
-    let input_reserve = virtual_quote_reserve.saturating_add(real_quote_reserve);
-    let output_reserve = virtual_base_reserve.saturating_sub(real_base_reserve);
-    
-    if output_reserve == 0 || output_reserve > virtual_base_reserve {
-        return 0;
-    }
-    
-    let numerator = (quote_amount_in as u128).saturating_mul(output_reserve as u128);
-    let denominator = (input_reserve as u128).saturating_add(quote_amount_in as u128);
-    
-    if denominator == 0 {
-        return 0;
-    }
-    
-    numerator.checked_div(denominator).unwrap_or(0) as u64
-}
-
 #[inline]
 fn calculate_raydium_sell_amount_out(
     base_amount_in: u64,
@@ -503,15 +454,15 @@ fn calculate_raydium_sell_amount_out(
 fn create_swap_instruction(
     program_id: Pubkey,
     discriminator: [u8; 8],
-    base_amount: u64,
-    quote_amount: u64,
+    amount_in: u64,
+    minimum_amount_out: u64,
     accounts: Vec<AccountMeta>,
 ) -> Instruction {
     let mut data = Vec::with_capacity(24);
     let share_fee_rate = 0_u64;
     data.extend_from_slice(&discriminator);
-    data.extend_from_slice(&base_amount.to_le_bytes());
-    data.extend_from_slice(&quote_amount.to_le_bytes());
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&minimum_amount_out.to_le_bytes());
     data.extend_from_slice(&share_fee_rate.to_le_bytes());
     
     Instruction { program_id, accounts, data }

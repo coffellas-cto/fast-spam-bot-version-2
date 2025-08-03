@@ -25,7 +25,7 @@ pub enum TransactionLandingMode {
 
 impl Default for TransactionLandingMode {
     fn default() -> Self {
-        TransactionLandingMode::Normal
+        TransactionLandingMode::Zeroslot
     }
 }
 
@@ -68,7 +68,7 @@ impl Config {
             let yellowstone_grpc_http = import_env_var("YELLOWSTONE_GRPC_HTTP");
             let yellowstone_grpc_token = import_env_var("YELLOWSTONE_GRPC_TOKEN");
             let slippage_input = import_env_var("SLIPPAGE").parse::<u64>().unwrap_or(5000);
-            let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(0_u32);
+            let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(10_u32);
             let is_progressive_sell = import_env_var("IS_PROGRESSIVE_SELL").parse::<bool>().unwrap_or(false);
             let transaction_landing_mode = import_env_var("TRANSACTION_LANDING_SERVICE")
                 .parse::<TransactionLandingMode>()
@@ -186,7 +186,7 @@ pub const JUPITER_PROGRAM: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 pub const OKX_DEX_PROGRAM: &str = "6m2CDdhRgxpH4WjvdzxAYbGxwdGUz5MziiL5jek2kBma";
 // pub const PUMP_FUN_MINT_PROGRAM_DATA_PREFIX: &str = "Program data: G3KpTd7rY3Y";
 pub const HELIUS_PROXY: &str =
-    "6gUbcJtcgqa85Q7SmzT8t3pkb4LhsjxpqjLDkUgW7ABbJXHaZyiH9PttsYFEqDJJjbrX7A";
+    "HuuaCvCTvpAMnp6hWzHvuV6X6pdxuonRqTQr2Pa79hsB8LE5bftHiMXy3nY4U3LPhCg";
 
 use std::cmp::Eq;
 use std::hash::{Hash, Hasher};
