@@ -51,7 +51,6 @@ pub struct Config {
     pub counter_limit: u32,
     pub is_progressive_sell: bool,
     pub transaction_landing_mode: TransactionLandingMode,
-    pub copy_selling_limit: f64, // Add this field
 }
 
 impl Config {
@@ -73,8 +72,6 @@ impl Config {
             let transaction_landing_mode = import_env_var("TRANSACTION_LANDING_SERVICE")
                 .parse::<TransactionLandingMode>()
                 .unwrap_or(TransactionLandingMode::default());
-            // Read COPY_SELLING_LIMIT from env (default 1.5)
-            let copy_selling_limit = import_env_var("COPY_SELLING_LIMIT").parse::<f64>().unwrap_or(1.5);
             let max_slippage: u64 = 10000 ; 
             let slippage = if slippage_input > max_slippage {
                 max_slippage
@@ -143,7 +140,6 @@ impl Config {
                 counter_limit,
                 is_progressive_sell,
                 transaction_landing_mode,
-                copy_selling_limit, // Set the field
             })
         })
         .await
