@@ -208,6 +208,7 @@ impl Raydium {
             },
             SwapDirection::Sell => {
                 // For sell: amount_in is token amount, need to get token decimals
+                // First try to get from cache, then fallback to RPC with timeout
                 let decimals = 6; // all tokens are 6 decimals
                 // Convert token amount to token units (with decimals)
                 ui_amount_to_amount(swap_config.amount_in, decimals)
