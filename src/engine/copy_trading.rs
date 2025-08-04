@@ -78,7 +78,6 @@ pub struct CopyTradingConfig {
     pub target_addresses: Vec<String>,
     pub excluded_addresses: Vec<String>,
     pub protocol_preference: SwapProtocol,
-    pub is_progressive_sell: bool,
     pub is_reverse: bool,
     pub min_dev_buy: f64,
     pub max_dev_buy: f64,

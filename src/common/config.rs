@@ -49,7 +49,6 @@ pub struct Config {
     pub app_state: AppState,
     pub swap_config: SwapConfig,
     pub counter_limit: u32,
-    pub is_progressive_sell: bool,
     pub transaction_landing_mode: TransactionLandingMode,
 }
 
@@ -68,11 +67,10 @@ impl Config {
             let yellowstone_grpc_token = import_env_var("YELLOWSTONE_GRPC_TOKEN");
             let slippage_input = import_env_var("SLIPPAGE").parse::<u64>().unwrap_or(5000);
             let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(10_u32);
-            let is_progressive_sell = import_env_var("IS_PROGRESSIVE_SELL").parse::<bool>().unwrap_or(false);
             let transaction_landing_mode = import_env_var("TRANSACTION_LANDING_SERVICE")
                 .parse::<TransactionLandingMode>()
                 .unwrap_or(TransactionLandingMode::default());
-            let max_slippage: u64 = 10000 ; 
+            let max_slippage: u64 = 10000 ;
             let slippage = if slippage_input > max_slippage {
                 max_slippage
             } else {
@@ -138,7 +136,6 @@ impl Config {
                 app_state,
                 swap_config,
                 counter_limit,
-                is_progressive_sell,
                 transaction_landing_mode,
             })
         })
