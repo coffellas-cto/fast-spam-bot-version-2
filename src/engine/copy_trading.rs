@@ -78,8 +78,6 @@ pub struct CopyTradingConfig {
     pub target_addresses: Vec<String>,
     pub excluded_addresses: Vec<String>,
     pub protocol_preference: SwapProtocol,
-    pub is_progressive_sell: bool,
-    pub is_reverse: bool,
     pub min_dev_buy: f64,
     pub max_dev_buy: f64,
     pub transaction_landing_mode: crate::common::config::TransactionLandingMode,
@@ -114,7 +112,6 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     logger.log("Initializing copy trading bot...".green().to_string());
     logger.log(format!("Target addresses: {:?}", config.target_addresses));
     logger.log(format!("Protocol preference: {:?}", config.protocol_preference));
-    logger.log(format!("Reverse mode enabled: {}", config.is_reverse).cyan().to_string());
     logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string());
     
     // Log initial counter status
