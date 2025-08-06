@@ -5,7 +5,6 @@ use anchor_client::solana_sdk::pubkey::Pubkey;
 use spl_token_2022::state::{Account, Mint};
 use spl_token_2022::extension::StateWithExtensionsOwned;
 use lazy_static::lazy_static;
-use crate::dex::pump_swap::PumpSwapPool;
 
 /// TTL Cache entry that stores a value with an expiration time
 pub struct CacheEntry<T> {
@@ -117,53 +116,6 @@ impl TokenMintCache {
     pub fn size(&self) -> usize {
         let mints = self.mints.read().unwrap();
         mints.len()
-    }
-}
-
-/// PumpSwap pool cache
-pub struct PoolCache {
-    pools: RwLock<HashMap<Pubkey, CacheEntry<PumpSwapPool>>>,
-    default_ttl: u64,
-}
-
-impl PoolCache {
-    pub fn new(default_ttl: u64) -> Self {
-        Self {
-            pools: RwLock::new(HashMap::new()),
-            default_ttl,
-        }
-    }
-    
-    pub fn get(&self, mint: &Pubkey) -> Option<PumpSwapPool> {
-        let pools = self.pools.read().unwrap();
-        if let Some(entry) = pools.get(mint) {
-            if !entry.is_expired() {
-                return Some(entry.value.clone());
-            }
-        }
-        None
-    }
-    
-    pub fn insert(&self, mint: Pubkey, pool: PumpSwapPool, ttl: Option<u64>) {
-        let ttl = ttl.unwrap_or(self.default_ttl);
-        let mut pools = self.pools.write().unwrap();
-        pools.insert(mint, CacheEntry::new(pool, ttl));
-    }
-    
-    pub fn remove(&self, mint: &Pubkey) {
-        let mut pools = self.pools.write().unwrap();
-        pools.remove(mint);
-    }
-    
-    pub fn clear_expired(&self) {
-        let mut pools = self.pools.write().unwrap();
-        pools.retain(|_, entry| !entry.is_expired());
-    }
-    
-    // Get the current size of the cache
-    pub fn size(&self) -> usize {
-        let pools = self.pools.read().unwrap();
-        pools.len()
     }
 }
 
@@ -330,7 +282,6 @@ impl BoughtTokensTracker {
 lazy_static! {
     pub static ref TOKEN_ACCOUNT_CACHE: TokenAccountCache = TokenAccountCache::new(60); // 60 seconds TTL
     pub static ref TOKEN_MINT_CACHE: TokenMintCache = TokenMintCache::new(300); // 5 minutes TTL
-    pub static ref POOL_CACHE: PoolCache = PoolCache::new(30); // 30 seconds TTL
     pub static ref WALLET_TOKEN_ACCOUNTS: WalletTokenAccounts = WalletTokenAccounts::new();
     pub static ref TARGET_WALLET_TOKENS: TargetWalletTokens = TargetWalletTokens::new();
     pub static ref BOUGHT_TOKENS: BoughtTokensTracker = BoughtTokensTracker::new();
