@@ -3,7 +3,7 @@ use tokio::time;
 use colored::Colorize;
 
 use crate::common::logger::Logger;
-use crate::common::cache::{TOKEN_ACCOUNT_CACHE, TOKEN_MINT_CACHE, POOL_CACHE};
+use crate::common::cache::{TOKEN_ACCOUNT_CACHE, TOKEN_MINT_CACHE};
 
 /// CacheMaintenanceService handles periodic cleanup of expired cache entries
 pub struct CacheMaintenanceService {
@@ -45,17 +45,11 @@ impl CacheMaintenanceService {
         TOKEN_MINT_CACHE.clear_expired();
         let token_mint_count_after = TOKEN_MINT_CACHE.size();
         
-        // Clean up pool cache
-        let pool_count_before = POOL_CACHE.size();
-        POOL_CACHE.clear_expired();
-        let pool_count_after = POOL_CACHE.size();
-        
         // Log cleanup results
         self.logger.log(format!(
-            "Cache cleanup complete - Token accounts: {} -> {}, Token mints: {} -> {}, Pools: {} -> {}",
+            "Cache cleanup complete - Token accounts: {} -> {}, Token mints: {} -> {}",
             token_account_count_before, token_account_count_after,
-            token_mint_count_before, token_mint_count_after,
-            pool_count_before, pool_count_after
+            token_mint_count_before, token_mint_count_after
         ));
     }
 }
