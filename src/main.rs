@@ -1,13 +1,39 @@
 /*
- * Copy Trading Bot with PumpSwap Notification Mode
+ * Copy Trading Bot with PumpSwap Notification Mode and Jupiter Integration
  * 
- * Changes made:
+ * Features:
  * - Modified PumpSwap buy/sell logic to only send notifications without executing transactions
  * - Transaction processing now runs in separate tokio tasks to ensure main monitoring continues
  * - Added placeholder for future selling strategy implementation
  * - PumpFun protocol functionality remains unchanged
  * - Added caching and batch RPC calls for improved performance
+ * - Added --sell command to sell all holding tokens using Jupiter API
+ * 
+ * Usage Commands:
+ * - cargo run -- --wrap       : Wrap SOL to WSOL (amount from WRAP_AMOUNT env var)
+ * - cargo run -- --unwrap     : Unwrap WSOL back to SOL
+ * - cargo run -- --close      : Close all empty token accounts
+ * - cargo run -- --sell       : Sell all holding tokens using Jupiter API (NEW!)
+ * - cargo run -- --check-tokens : Check token tracking status
+ * - cargo run                  : Start copy trading bot
+ * 
+ * Jupiter API Integration:
+ * The --sell command performs the following operations:
+ * 1. Fetches all token accounts owned by the wallet
+ * 2. Gets current prices for all tokens using Jupiter Price API
+ * 3. Filters tokens worth more than $1 USD
+ * 4. For each valuable token:
+ *    - Gets a quote from Jupiter Quote API (1% slippage)
+ *    - Gets swap transaction from Jupiter Swap API
+ *    - Signs and executes the transaction via RPC
+ *    - Waits for confirmation
+ * 5. Reports successful sales and total SOL received
+ * 
+ * Environment Variables:
+ * - WRAP_AMOUNT: Amount of SOL to wrap (default: 0.1)
+ * - Standard bot configuration variables (RPC URLs, wallet keys, etc.)
  */
+
 use anchor_client::solana_sdk::signature::Signer;
 use solana_vntr_sniper::{
     common::{config::Config, constants::RUN_MSG, cache::WALLET_TOKEN_ACCOUNTS},
@@ -15,23 +41,109 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, jupiter::JupiterClient},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor},
     core::token,
 };
 use solana_program_pack::Pack;
 use anchor_client::solana_sdk::pubkey::Pubkey;
+use anchor_client::solana_sdk::transaction::{Transaction, VersionedTransaction};
 use anchor_client::solana_sdk::system_instruction;
+use anchor_client::solana_sdk::message::{Message, VersionedMessage};
 use std::str::FromStr;
 use colored::Colorize;
 use spl_token::instruction::sync_native;
 use spl_token::ui_amount_to_amount;
 use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::signal;
+use serde::{Deserialize, Serialize};
+use reqwest;
+use std::collections::HashMap;
+use base64;
 
-// Global flag to track shutdown state
-pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+// Jupiter API structures
+#[derive(Debug, Serialize, Deserialize)]
+struct JupiterQuoteRequest {
+    #[serde(rename = "inputMint")]
+    input_mint: String,
+    #[serde(rename = "outputMint")]
+    output_mint: String,
+    amount: String,
+    #[serde(rename = "slippageBps")]
+    slippage_bps: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JupiterQuoteResponse {
+    #[serde(rename = "inputMint")]
+    input_mint: String,
+    #[serde(rename = "inAmount")]
+    in_amount: String,
+    #[serde(rename = "outputMint")]
+    output_mint: String,
+    #[serde(rename = "outAmount")]
+    out_amount: String,
+    #[serde(rename = "otherAmountThreshold")]
+    other_amount_threshold: String,
+    #[serde(rename = "swapMode")]
+    swap_mode: String,
+    #[serde(rename = "slippageBps")]
+    slippage_bps: u16,
+    #[serde(rename = "priceImpactPct")]
+    price_impact_pct: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PrioritizationFeeLamports {
+    #[serde(rename = "priorityLevelWithMaxLamports")]
+    priority_level_with_max_lamports: PriorityLevelWithMaxLamports,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PriorityLevelWithMaxLamports {
+    #[serde(rename = "maxLamports")]
+    max_lamports: u64,
+    #[serde(rename = "priorityLevel")]
+    priority_level: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JupiterSwapRequest {
+    #[serde(rename = "quoteResponse")]
+    quote_response: JupiterQuoteResponse,
+    #[serde(rename = "userPublicKey")]
+    user_public_key: String,
+    #[serde(rename = "wrapAndUnwrapSol")]
+    wrap_and_unwrap_sol: bool,
+    #[serde(rename = "dynamicComputeUnitLimit")]
+    dynamic_compute_unit_limit: bool,
+    #[serde(rename = "prioritizationFeeLamports")]
+    prioritization_fee_lamports: PrioritizationFeeLamports,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JupiterSwapResponse {
+    #[serde(rename = "swapTransaction")]
+    swap_transaction: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JupiterPriceResponse {
+    #[serde(rename = "usdPrice")]
+    usd_price: f64,
+}
+
+#[derive(Debug)]
+struct TokenAccount {
+    mint: String,
+    amount: f64,
+    decimals: u8,
+    account_address: String,
+}
+
+// Constants
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const JUPITER_API_URL: &str = "https://quote-api.jup.ag";
 
 /// Initialize the wallet token account list by fetching all token accounts owned by the wallet
 async fn initialize_token_account_list(config: &Config) {
@@ -357,94 +469,397 @@ async fn initialize_target_wallet_token_list(config: &Config, target_addresses: 
     Ok(())
 }
 
-/// Sell all token holdings using Jupiter API
-async fn sell_all_tokens(config: &Config) -> Result<(), String> {
-    let logger = solana_vntr_sniper::common::logger::Logger::new("[SELL-ALL] => ".yellow().to_string());
+/// Get all token accounts for the wallet
+async fn get_wallet_token_accounts(config: &Config) -> Result<Vec<TokenAccount>, String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[GET-TOKEN-ACCOUNTS] => ".green().to_string());
     
-    logger.log("Starting to sell all token holdings...".to_string());
+    let wallet_pubkey = match config.app_state.wallet.try_pubkey() {
+        Ok(pk) => pk,
+        Err(_) => return Err("Failed to get wallet pubkey".to_string()),
+    };
     
-    // Initialize Jupiter client
-    let jupiter_client = JupiterClient::new();
+    logger.log(format!("Getting token accounts for wallet: {}", wallet_pubkey));
     
-    // Get wallet keypair
-    let wallet_keypair = &config.app_state.wallet;
+    // Get the token program pubkey
+    let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
     
-    // Sell all tokens
-    match jupiter_client.sell_all_tokens(
-        &config.app_state.rpc_nonblocking_client,
-        wallet_keypair,
-        Some(100), // 1% slippage
-    ).await {
-        Ok(results) => {
-            let successful_sales = results.values().filter(|v| !v.contains("Error")).count();
-            logger.log(format!("✅ Token selling completed! {}/{} tokens sold successfully", successful_sales, results.len()));
-            
-            // Log individual results
-            for (mint, result) in results {
-                if result.contains("Error") {
-                    logger.log(format!("❌ {}: {}", mint, result).red().to_string());
-                } else {
-                    logger.log(format!("✅ {}: {}", mint, result));
+    // Query all token accounts owned by the wallet
+    let accounts = config.app_state.rpc_client.get_token_accounts_by_owner(
+        &wallet_pubkey,
+        anchor_client::solana_client::rpc_request::TokenAccountsFilter::ProgramId(token_program)
+    ).map_err(|e| format!("Failed to get token accounts: {}", e))?;
+    
+    let mut token_accounts = Vec::new();
+    
+    for account_info in accounts {
+        let token_account_pubkey = Pubkey::from_str(&account_info.pubkey)
+            .map_err(|_| format!("Invalid token account pubkey: {}", account_info.pubkey))?;
+        
+        // Get account data
+        let account_data = match config.app_state.rpc_client.get_account(&token_account_pubkey) {
+            Ok(data) => data,
+            Err(e) => {
+                logger.log(format!("Failed to get account data for {}: {}", token_account_pubkey, e).yellow().to_string());
+                continue;
+            }
+        };
+        
+        // Parse token account data
+        if let Ok(token_data) = spl_token::state::Account::unpack(&account_data.data) {
+            if token_data.amount > 0 {
+                // Get proper decimals from mint account
+                let decimals = match config.app_state.rpc_client.get_account(&token_data.mint) {
+                    Ok(mint_account) => {
+                        if let Ok(mint_data) = spl_token::state::Mint::unpack(&mint_account.data) {
+                            mint_data.decimals
+                        } else {
+                            9 // Default decimals
+                        }
+                    },
+                    Err(_) => 9 // Default decimals
+                };
+                
+                // Convert amount to UI amount using proper decimals
+                let ui_amount = token_data.amount as f64 / 10f64.powi(decimals as i32);
+                
+                if ui_amount > 0.0 {
+                    token_accounts.push(TokenAccount {
+                        mint: token_data.mint.to_string(),
+                        amount: ui_amount,
+                        decimals,
+                        account_address: account_info.pubkey,
+                    });
+                    
+                    logger.log(format!("Found token: {} - Amount: {} - Decimals: {}", 
+                                     token_data.mint, ui_amount, decimals));
                 }
             }
-            
-            Ok(())
-        },
-        Err(e) => {
-            logger.log(format!("❌ Failed to sell tokens: {}", e).red().to_string());
-            Err(format!("Failed to sell tokens: {}", e))
         }
     }
+    
+    logger.log(format!("Found {} tokens with balance", token_accounts.len()));
+    Ok(token_accounts)
 }
 
-/// Handle shutdown signals and sell all tokens before exiting
-async fn setup_signal_handlers() {
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            
-            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
-            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-            
-            tokio::select! {
-                _ = sigint.recv() => {
-                    println!("\n🛑 Received SIGINT (Ctrl+C), selling all tokens before exit...");
-                },
-                _ = sigterm.recv() => {
-                    println!("\n🛑 Received SIGTERM, selling all tokens before exit...");
-                },
+/// Get token prices from Jupiter API
+async fn get_token_prices(mints: &[String]) -> Result<HashMap<String, JupiterPriceResponse>, String> {
+    if mints.is_empty() {
+        return Ok(HashMap::new());
+    }
+    
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[GET-PRICES] => ".cyan().to_string());
+    logger.log(format!("Getting prices for {} tokens", mints.len()));
+    
+    let client = reqwest::Client::new();
+    let mint_string = mints.join(",");
+    let url = format!("{}/v6/price?ids={}", JUPITER_API_URL, mint_string);
+    
+    let response = client.get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to get prices: {}", e))?;
+    
+    if !response.status().is_success() {
+        return Err(format!("Price API returned status: {}", response.status()));
+    }
+    
+    let prices: HashMap<String, JupiterPriceResponse> = response.json()
+        .await
+        .map_err(|e| format!("Failed to parse price response: {}", e))?;
+    
+    logger.log(format!("Retrieved prices for {} tokens", prices.len()));
+    Ok(prices)
+}
+
+/// Get Jupiter quote for token swap
+async fn get_jupiter_quote(
+    input_mint: &str,
+    output_mint: &str,
+    amount: u64,
+    slippage_bps: u16,
+) -> Result<JupiterQuoteResponse, String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[JUPITER-QUOTE] => ".yellow().to_string());
+    logger.log(format!("Getting quote: {} -> {} (amount: {})", input_mint, output_mint, amount));
+    
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+        JUPITER_API_URL, input_mint, output_mint, amount, slippage_bps
+    );
+    
+    let response = client.get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to get quote: {}", e))?;
+    
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("Quote API returned status: {} - {}", response.status(), error_text));
+    }
+    
+    let quote: JupiterQuoteResponse = response.json()
+        .await
+        .map_err(|e| format!("Failed to parse quote response: {}", e))?;
+    
+    logger.log(format!("Quote received: {} {} -> {} {}", 
+                     quote.in_amount, input_mint, quote.out_amount, output_mint));
+    
+    Ok(quote)
+}
+
+/// Get Jupiter swap transaction
+async fn get_jupiter_swap_transaction(
+    quote: JupiterQuoteResponse,
+    user_public_key: &str,
+) -> Result<String, String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[JUPITER-SWAP] => ".blue().to_string());
+    logger.log("Getting swap transaction from Jupiter");
+    
+    let client = reqwest::Client::new();
+    let url = format!("{}/v6/swap", JUPITER_API_URL);
+    
+    let swap_request = JupiterSwapRequest {
+        quote_response: quote,
+        user_public_key: user_public_key.to_string(),
+        wrap_and_unwrap_sol: true,
+        dynamic_compute_unit_limit: true,
+        prioritization_fee_lamports: PrioritizationFeeLamports {
+            priority_level_with_max_lamports: PriorityLevelWithMaxLamports {
+                max_lamports: 1000000,
+                priority_level: "high".to_string(),
+            },
+        },
+    };
+    
+    let response = client.post(&url)
+        .json(&swap_request)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to get swap transaction: {}", e))?;
+    
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("Swap API returned status: {} - {}", response.status(), error_text));
+    }
+    
+    let swap_response: JupiterSwapResponse = response.json()
+        .await
+        .map_err(|e| format!("Failed to parse swap response: {}", e))?;
+    
+    logger.log("Swap transaction received from Jupiter");
+    Ok(swap_response.swap_transaction)
+}
+
+/// Execute Jupiter swap transaction
+async fn execute_swap_transaction(
+    config: &Config,
+    swap_transaction_base64: &str,
+) -> Result<String, String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[EXECUTE-SWAP] => ".green().to_string());
+    logger.log("Executing swap transaction");
+    
+    // Decode the base64 transaction
+    let transaction_bytes = base64::decode(swap_transaction_base64)
+        .map_err(|e| format!("Failed to decode transaction: {}", e))?;
+    
+    // Try to deserialize as versioned transaction first
+    if let Ok(mut versioned_transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+        // Get recent blockhash
+        let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
+            .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+        
+        // Update blockhash in the message
+        match &mut versioned_transaction.message {
+            VersionedMessage::Legacy(ref mut message) => {
+                message.recent_blockhash = recent_blockhash;
+            },
+            VersionedMessage::V0(ref mut message) => {
+                message.recent_blockhash = recent_blockhash;
             }
         }
         
-        #[cfg(windows)]
-        {
-            let mut ctrl_c = signal::ctrl_c();
-            ctrl_c.await.expect("Failed to install Ctrl+C handler");
-            println!("\n🛑 Received Ctrl+C, selling all tokens before exit...");
+        // Sign the transaction
+        let signers = vec![&config.app_state.wallet];
+        versioned_transaction.try_sign(&signers, recent_blockhash)
+            .map_err(|e| format!("Failed to sign transaction: {}", e))?;
+        
+        // Send the transaction with retry logic
+        let mut attempts = 0;
+        let max_attempts = 3;
+        
+        while attempts < max_attempts {
+            attempts += 1;
+            
+            // Use send_raw_transaction for better control
+            let serialized_transaction = bincode::serialize(&versioned_transaction)
+                .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
+            
+            match config.app_state.rpc_client.send_raw_transaction(&serialized_transaction) {
+                Ok(signature) => {
+                    logger.log(format!("Swap transaction sent: {}", signature));
+                    
+                    // Wait for confirmation
+                    for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        
+                        if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
+                            if let Some(result) = status {
+                                if result.is_ok() {
+                                    logger.log(format!("Swap transaction confirmed: {}", signature));
+                                    return Ok(signature.to_string());
+                                } else {
+                                    return Err(format!("Transaction failed: {:?}", result));
+                                }
+                            }
+                        }
+                    }
+                    
+                    return Err("Transaction confirmation timeout".to_string());
+                },
+                Err(e) => {
+                    logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                    
+                    if attempts >= max_attempts {
+                        return Err(format!("All swap attempts failed. Last error: {}", e));
+                    }
+                    
+                    // Wait before retry
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
         }
-        
-        // Set shutdown flag
-        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-        
-        // Sell all tokens before shutdown
-        let config_guard = Config::get().await;
-        if let Err(e) = sell_all_tokens(&config_guard).await {
-            eprintln!("❌ Error selling tokens during shutdown: {}", e);
+    } else {
+        return Err("Failed to deserialize transaction as VersionedTransaction".to_string());
+    }
+    
+    Err("Maximum retry attempts exceeded".to_string())
+}
+
+/// Sell a specific token using Jupiter API
+async fn sell_token(config: &Config, token: &TokenAccount) -> Result<String, String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new(format!("[SELL-TOKEN] {} => ", token.mint).magenta().to_string());
+    
+    // Skip SOL and WSOL
+    if token.mint == SOL_MINT || token.mint == WSOL_MINT {
+        logger.log("Skipping SOL/WSOL token".to_string());
+        return Ok("Skipped SOL/WSOL".to_string());
+    }
+    
+    logger.log(format!("Selling {} {} (decimals: {})", token.amount, token.mint, token.decimals));
+    
+    // Convert amount to smallest unit
+    let amount_in_smallest_unit = (token.amount * 10f64.powi(token.decimals as i32)) as u64;
+    logger.log(format!("Amount in smallest unit: {}", amount_in_smallest_unit));
+    
+    // Get quote from Jupiter
+    let quote = get_jupiter_quote(
+        &token.mint,
+        SOL_MINT,
+        amount_in_smallest_unit,
+        100, // 1% slippage
+    ).await?;
+    
+    // Calculate expected SOL output
+    let expected_sol = quote.out_amount.parse::<u64>()
+        .map_err(|e| format!("Failed to parse output amount: {}", e))? as f64 / 1e9;
+    
+    logger.log(format!("Expected SOL output: {}", expected_sol));
+    
+    // Get wallet pubkey
+    let wallet_pubkey = config.app_state.wallet.try_pubkey()
+        .map_err(|_| "Failed to get wallet pubkey".to_string())?;
+    
+    // Get swap transaction
+    let swap_transaction = get_jupiter_swap_transaction(quote, &wallet_pubkey.to_string()).await?;
+    
+    // Execute the swap
+    let signature = execute_swap_transaction(config, &swap_transaction).await?;
+    
+    logger.log(format!("Token sold successfully! Signature: {}", signature));
+    Ok(signature)
+}
+
+/// Sell all holding tokens using Jupiter API
+async fn sell_all_tokens(config: &Config) -> Result<(), String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[SELL-ALL-TOKENS] => ".red().to_string());
+    
+    logger.log("Starting to sell all holding tokens".to_string());
+    
+    // Get all token accounts
+    let token_accounts = get_wallet_token_accounts(config).await?;
+    
+    if token_accounts.is_empty() {
+        logger.log("No tokens found to sell".to_string());
+        return Ok(());
+    }
+    
+    logger.log(format!("Found {} tokens to potentially sell", token_accounts.len()));
+    
+    // Get token prices to filter valuable tokens
+    let mints: Vec<String> = token_accounts.iter().map(|t| t.mint.clone()).collect();
+    let prices = get_token_prices(&mints).await.unwrap_or_default();
+    
+    let mut successful_sales = 0;
+    let mut failed_sales = 0;
+    let mut total_sol_received = 0.0;
+    
+    // Sell each token
+    for token in &token_accounts {
+        // Check if token is valuable (worth more than $1)
+        let is_valuable = if let Some(price_info) = prices.get(&token.mint) {
+            let token_value = token.amount * price_info.usd_price;
+            logger.log(format!("Token {} value: ${:.2}", token.mint, token_value));
+            token_value > 1.0
         } else {
-            println!("✅ Successfully sold all tokens during shutdown");
+            logger.log(format!("No price found for token {}, attempting to sell anyway", token.mint));
+            true
+        };
+        
+        if !is_valuable {
+            logger.log(format!("Skipping token {} (value < $1)", token.mint));
+            continue;
         }
         
-        println!("👋 Shutting down...");
-        std::process::exit(0);
-    });
+        match sell_token(config, token).await {
+            Ok(signature) => {
+                logger.log(format!("✅ Successfully sold {}: {}", token.mint, signature));
+                successful_sales += 1;
+                
+                // Try to estimate SOL received (this is approximate)
+                if let Ok(quote) = get_jupiter_quote(&token.mint, SOL_MINT, 
+                    (token.amount * 10f64.powi(token.decimals as i32)) as u64, 100).await {
+                    if let Ok(sol_amount) = quote.out_amount.parse::<u64>() {
+                        total_sol_received += sol_amount as f64 / 1e9;
+                    }
+                }
+            },
+            Err(e) => {
+                logger.log(format!("❌ Failed to sell {}: {}", token.mint, e).red().to_string());
+                failed_sales += 1;
+            }
+        }
+        
+        // Add delay between swaps to avoid rate limiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    }
+    
+    logger.log(format!(
+        "Selling completed! ✅ {} successful, ❌ {} failed, ~{:.6} SOL received",
+        successful_sales, failed_sales, total_sol_received
+    ));
+    
+    if failed_sales > 0 {
+        Err(format!("Some token sales failed: {} out of {}", failed_sales, successful_sales + failed_sales))
+    } else {
+        Ok(())
+    }
 }
 
 #[tokio::main]
 async fn main() {
     /* Initial Settings */
-    let _config_mutex = Config::new().await;
-    let config = Config::get().await;
+    let config = Config::new().await;
+    let config = config.lock().await;
 
     /* Running Bot */
     let run_msg = RUN_MSG;
@@ -525,15 +940,14 @@ async fn main() {
             println!("{}", summary);
             return;
         } else if args.contains(&"--sell".to_string()) {
-            println!("💱 Selling all token holdings...");
-            
+            println!("Selling all holding tokens using Jupiter API...");
             match sell_all_tokens(&config).await {
                 Ok(_) => {
-                    println!("✅ Successfully sold all token holdings");
+                    println!("Successfully sold all holding tokens!");
                     return;
                 },
                 Err(e) => {
-                    eprintln!("❌ Failed to sell all token holdings: {}", e);
+                    eprintln!("Failed to sell all tokens: {}", e);
                     return;
                 }
             }
@@ -598,9 +1012,6 @@ async fn main() {
         eprintln!("Failed to initialize target wallet token list: {}", e);
         return;
     }
-    
-    // Set up signal handlers for graceful shutdown with token selling
-    setup_signal_handlers().await;
     
     // Get protocol preference from environment
     let protocol_preference = std::env::var("PROTOCOL_PREFERENCE")
