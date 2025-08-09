@@ -357,8 +357,48 @@ async fn initialize_target_wallet_token_list(config: &Config, target_addresses: 
     Ok(())
 }
 
+/// Sell all token holdings using Jupiter API
+async fn sell_all_tokens(config: &Config) -> Result<(), String> {
+    let logger = solana_vntr_sniper::common::logger::Logger::new("[SELL-ALL] => ".yellow().to_string());
+    
+    logger.log("Starting to sell all token holdings...".to_string());
+    
+    // Initialize Jupiter client
+    let jupiter_client = JupiterClient::new();
+    
+    // Get wallet keypair
+    let wallet_keypair = &config.app_state.wallet;
+    
+    // Sell all tokens
+    match jupiter_client.sell_all_tokens(
+        &config.app_state.rpc_client,
+        wallet_keypair,
+        Some(100), // 1% slippage
+    ).await {
+        Ok(results) => {
+            let successful_sales = results.values().filter(|v| !v.contains("Error")).count();
+            logger.log(format!("✅ Token selling completed! {}/{} tokens sold successfully", successful_sales, results.len()));
+            
+            // Log individual results
+            for (mint, result) in results {
+                if result.contains("Error") {
+                    logger.log(format!("❌ {}: {}", mint, result).red().to_string());
+                } else {
+                    logger.log(format!("✅ {}: {}", mint, result));
+                }
+            }
+            
+            Ok(())
+        },
+        Err(e) => {
+            logger.log(format!("❌ Failed to sell tokens: {}", e).red().to_string());
+            Err(format!("Failed to sell tokens: {}", e))
+        }
+    }
+}
+
 /// Handle shutdown signals and sell all tokens before exiting
-async fn setup_signal_handlers(config: Arc<tokio::sync::Mutex<Config>>) {
+async fn setup_signal_handlers() {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -388,7 +428,7 @@ async fn setup_signal_handlers(config: Arc<tokio::sync::Mutex<Config>>) {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
         
         // Sell all tokens before shutdown
-        let config_guard = config.lock().await;
+        let config_guard = Config::get().await;
         if let Err(e) = sell_all_tokens(&config_guard).await {
             eprintln!("❌ Error selling tokens during shutdown: {}", e);
         } else {
@@ -403,9 +443,8 @@ async fn setup_signal_handlers(config: Arc<tokio::sync::Mutex<Config>>) {
 #[tokio::main]
 async fn main() {
     /* Initial Settings */
-    let config = Config::new().await;
-    let config_arc = Arc::new(config);
-    let config = config_arc.lock().await;
+    let _config_mutex = Config::new().await;
+    let config = Config::get().await;
 
     /* Running Bot */
     let run_msg = RUN_MSG;
@@ -561,7 +600,7 @@ async fn main() {
     }
     
     // Set up signal handlers for graceful shutdown with token selling
-    setup_signal_handlers(config_arc.clone()).await;
+    setup_signal_handlers().await;
     
     // Get protocol preference from environment
     let protocol_preference = std::env::var("PROTOCOL_PREFERENCE")
