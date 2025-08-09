@@ -1,0 +1,893 @@
+#!/usr/bin/env node
+
+require('dotenv').config();
+const {Connection,PublicKey,Keypair,Transaction,SystemProgram} = require('@solana/web3.js');
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const bs58 = require('bs58');
+const fs = require('fs');
+const path = require('path');
+const {signAndSendTransaction,waitForTransactionConfirmation} = require('./utils/transaction');
+
+// Check if --sell-only flag is provided
+const isSellOnlyMode = process.argv.includes('--sell-only');
+
+// Configuration from environment variables
+const config = {
+  rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+  walletAddress: process.env.WALLET_ADDRESS,
+  thresholdSol: parseFloat(process.env.THRESHOLD_SOL) || 1,
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID,
+  checkIntervalMinutes: parseInt(process.env.CHECK_INTERVAL_MINUTES) || 2,
+  jupiterApiUrl: process.env.JUPITER_API_URL || 'https://lite-api.jup.ag'
+};
+
+// Global variables
+let connection;
+let wallets = []; // Array to store multiple wallets
+let telegramBot;
+let previousBalances = new Map(); // Map to store previous balances for each wallet
+let isProcessing = false;
+let transferInProgress = new Set(); // Track wallets that are currently transferring
+
+// SOL mint address (wrapped SOL)
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+// WSOL mint address
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+/**
+ * Read all private keys from txt files in the data folder
+ * Each line in each file represents a separate wallet private key
+ */
+function loadWalletsFromDataFolder() {
+  const dataFolder = path.join(__dirname,'..','data');
+  const wallets = [];
+
+  try {
+    // Check if data folder exists
+    if(!fs.existsSync(dataFolder)) {
+      throw new Error(`Data folder not found: ${dataFolder}`);
+    }
+
+    // Read all txt files in the data folder
+    const files = fs.readdirSync(dataFolder).filter(file => file.endsWith('.txt'));
+
+    if(files.length === 0) {
+      throw new Error('No .txt files found in data folder');
+    }
+
+    console.log(`📁 Found ${files.length} wallet file(s) in data folder`);
+
+    for(const file of files) {
+      try {
+        const filePath = path.join(dataFolder,file);
+        const fileContent = fs.readFileSync(filePath,'utf8');
+
+        // Split content by lines and filter out empty lines
+        const privateKeys = fileContent.split('\n')
+          .map(line => line.trim())
+          .filter(line => line.length > 0);
+
+        if(privateKeys.length === 0) {
+          console.warn(`⚠️ No private keys found in file: ${file}`);
+          continue;
+        }
+
+        console.log(`📄 Reading ${privateKeys.length} wallet(s) from ${file}`);
+
+        // Process each private key in the file
+        for(let i = 0; i < privateKeys.length; i++) {
+          const privateKey = privateKeys[i];
+
+          // Validate private key format
+          try {
+            const secretKey = bs58.decode(privateKey);
+            const wallet = Keypair.fromSecretKey(secretKey);
+
+            wallets.push({
+              keypair: wallet,
+              publicKey: wallet.publicKey.toString(),
+              fileName: file,
+              lineNumber: i + 1
+            });
+
+            console.log(`✅ Loaded wallet from ${file} (line ${i + 1}): ${wallet.publicKey.toString()}`);
+          } catch(error) {
+            console.error(`❌ Invalid private key in file ${file} (line ${i + 1}): ${error.message}`);
+          }
+        }
+      } catch(error) {
+        console.error(`❌ Error reading file ${file}: ${error.message}`);
+      }
+    }
+
+    if(wallets.length === 0) {
+      throw new Error('No valid private keys found in data folder');
+    }
+
+    console.log(`🎉 Successfully loaded ${wallets.length} wallet(s) from ${files.length} file(s)`);
+    return wallets;
+  } catch(error) {
+    throw new Error(`Failed to load wallets from data folder: ${error.message}`);
+  }
+}
+
+/**
+ * Initialize the application
+ */
+async function initialize() {
+  if(isSellOnlyMode) {
+    console.log('💱 Starting Solana Token Sale Mode...');
+  } else {
+    console.log('🚀 Starting Solana Multi-Wallet Monitor...');
+  }
+
+  // Validate required environment variables
+  if(!config.telegramBotToken || !config.telegramChatId) {
+    throw new Error('TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required');
+  }
+
+  // Validate WALLET_ADDRESS when threshold is 0.1 (only in monitor mode)
+  if(!isSellOnlyMode && config.thresholdSol === 0.1 && !config.walletAddress) {
+    throw new Error('WALLET_ADDRESS is required when THRESHOLD_SOL is set to 0.1');
+  }
+
+  // Load wallets from data folder
+  wallets = loadWalletsFromDataFolder();
+
+  // Initialize Solana connection
+  connection = new Connection(config.rpcUrl,'confirmed');
+
+  console.log(`📍 Monitoring ${wallets.length} wallet(s):`);
+  wallets.forEach((wallet,index) => {
+    console.log(`  ${index + 1}. ${wallet.publicKey} (from ${wallet.fileName})`);
+  });
+
+  if(isSellOnlyMode) {
+    console.log(`💱 Mode: Token Sale Only (no SOL transfer)`);
+  } else {
+    console.log(`💰 Threshold: ${config.thresholdSol} SOL`);
+    if(config.walletAddress) {
+      console.log(`🎯 Transfer target: ${config.walletAddress}`);
+    }
+    console.log(`⏰ Check interval: ${config.checkIntervalMinutes} minutes`);
+  }
+
+  // Initialize Telegram bot
+  telegramBot = new TelegramBot(config.telegramBotToken);
+
+  // Send startup notification
+  const walletList = wallets.map((w,i) => `${i + 1}. ${w.publicKey}`).join('\n');
+  let startupMessage;
+
+  if(isSellOnlyMode) {
+    startupMessage = `💱 Token Sale Mode Started!\n` +
+      `Wallets (${wallets.length}):\n${walletList}\n` +
+      `Mode: Sell valuable tokens only (no SOL transfer)`;
+  } else {
+    startupMessage = `🤖 Multi-Wallet Monitor Started!\n` +
+      `Wallets (${wallets.length}):\n${walletList}\n` +
+      `Threshold: ${config.thresholdSol} SOL\n` +
+      `Monitoring every ${config.checkIntervalMinutes} minutes`;
+
+    if(config.walletAddress) {
+      startupMessage += `\n🎯 SOL will be transferred to: ${config.walletAddress}`;
+    }
+  }
+
+  await sendTelegramMessage(startupMessage);
+
+  console.log('✅ Initialization complete');
+}
+
+/**
+ * Send a message to Telegram
+ */
+async function sendTelegramMessage(message) {
+  try {
+    await telegramBot.sendMessage(config.telegramChatId,message);
+    console.log('📱 Telegram notification sent');
+  } catch(error) {
+    console.error('❌ Failed to send Telegram message:',error.message);
+  }
+}
+
+/**
+ * Get all token accounts for the wallet
+ */
+async function getWalletTokenAccounts(wallet) {
+  try {
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      wallet.keypair.publicKey,
+      {programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')}
+    );
+
+    return tokenAccounts.value.map(account => ({
+      mint: account.account.data.parsed.info.mint,
+      amount: account.account.data.parsed.info.tokenAmount.uiAmount,
+      decimals: account.account.data.parsed.info.tokenAmount.decimals
+    })).filter(token => token.amount > 0);
+  } catch(error) {
+    console.error('❌ Error fetching token accounts:',error.message);
+    return [];
+  }
+}
+
+/**
+ * Get SOL balance
+ */
+async function getSolBalance(wallet) {
+  try {
+    const balance = await connection.getBalance(wallet.keypair.publicKey);
+    return balance / 1e9; // Convert lamports to SOL
+  } catch(error) {
+    console.error('❌ Error fetching SOL balance:',error.message);
+    return 0;
+  }
+}
+
+/**
+ * Get token prices from Jupiter API
+ */
+async function getTokenPrices(mints) {
+  if(mints.length === 0) return {};
+
+  try {
+    const mintString = mints.join(',');
+    const response = await axios.get(`${config.jupiterApiUrl}/price/v3?ids=${mintString}`);
+    return response.data;
+  } catch(error) {
+    console.error('❌ Error fetching token prices:',error.message);
+    return {};
+  }
+}
+
+/**
+ * Calculate total wallet value in USD
+ */
+async function calculateWalletValue(wallet) {
+  const tokens = await getWalletTokenAccounts(wallet);
+  const solBalance = await getSolBalance(wallet);
+
+  // Get all mints including SOL
+  const allMints = [...tokens.map(t => t.mint),SOL_MINT];
+  const prices = await getTokenPrices(allMints);
+
+  let totalValue = 0;
+  const tokenValues = [];
+
+  // Calculate SOL value
+  const solPrice = prices[SOL_MINT]?.usdPrice || 0;
+  const solValue = solBalance * solPrice;
+  totalValue += solValue;
+
+  tokenValues.push({
+    symbol: 'SOL',
+    amount: solBalance,
+    price: solPrice,
+    value: solValue
+  });
+
+  // Calculate token values
+  for(const token of tokens) {
+    const price = prices[token.mint]?.usdPrice || 0;
+    const value = token.amount * price;
+    totalValue += value;
+
+    tokenValues.push({
+      mint: token.mint,
+      amount: token.amount,
+      price: price,
+      value: value,
+      decimals: token.decimals // Include decimals information
+    });
+  }
+
+  return {
+    totalValue,
+    totalValueInSol: totalValue / solPrice,
+    tokens: tokenValues,
+    solBalance,
+    solPrice
+  };
+}
+
+/**
+ * Check for balance changes and send notifications
+ */
+async function checkBalanceChanges(walletData,wallet) {
+  const changes = [];
+  const walletKey = wallet.publicKey;
+
+  for(const token of walletData.tokens) {
+    const key = `${walletKey}_${token.symbol || token.mint}`;
+    const previousAmount = previousBalances.get(key) || 0;
+
+    if(Math.abs(token.amount - previousAmount) > 0.0001) { // Threshold for change detection
+      changes.push({
+        token: token.symbol || token.mint,
+        previousAmount,
+        currentAmount: token.amount,
+        change: token.amount - previousAmount,
+        value: token.value
+      });
+    }
+
+    previousBalances.set(key,token.amount);
+  }
+
+  // Send notifications for changes
+  if(changes.length > 0) {
+    let message = `💸 Balance Changes Detected for ${wallet.publicKey}:\n\n`;
+
+    for(const change of changes) {
+      const changeText = change.change > 0 ? '+' : '';
+      message += `${change.token}: ${changeText}${change.change.toFixed(6)}\n`;
+      message += `Current: ${change.currentAmount.toFixed(6)}\n`;
+      message += `Value: $${change.value.toFixed(2)}\n\n`;
+    }
+
+    await sendTelegramMessage(message);
+  }
+}
+
+/**
+ * Transfer SOL to the specified wallet address
+ */
+async function transferSolToWallet(wallet,amountSol) {
+  // Check if transfer is already in progress for this wallet
+  if(transferInProgress.has(wallet.publicKey)) {
+    console.log(`⏳ Transfer already in progress for ${wallet.publicKey}, skipping...`);
+    return null;
+  }
+
+  transferInProgress.add(wallet.publicKey);
+
+  try {
+    console.log(`💸 Transferring ${amountSol.toFixed(6)} SOL from ${wallet.publicKey} to ${config.walletAddress}...`);
+
+    // Convert SOL to lamports
+    const amountLamports = Math.floor(amountSol * 1e9);
+
+    // Validate transfer amount
+    if(amountLamports <= 0) {
+      console.log(`⚠️ Transfer amount too small: ${amountSol} SOL, skipping transfer`);
+      return null;
+    }
+
+    // Create transfer instruction using SystemProgram
+    const transferInstruction = SystemProgram.transfer({
+      fromPubkey: wallet.keypair.publicKey,
+      toPubkey: new PublicKey(config.walletAddress),
+      lamports: amountLamports
+    });
+
+    // Create transaction
+    const transaction = new Transaction();
+    transaction.add(transferInstruction);
+
+    // Get recent blockhash
+    const {blockhash} = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = wallet.keypair.publicKey;
+
+    // Sign the transaction
+    transaction.sign(wallet.keypair);
+
+    // Send the transaction with retry logic
+    let signature;
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while(attempts < maxAttempts) {
+      try {
+        signature = await connection.sendRawTransaction(transaction.serialize(),{
+          skipPreflight: false,
+          preflightCommitment: 'confirmed'
+        });
+
+        // Wait for confirmation
+        await connection.confirmTransaction(signature,'confirmed');
+        break; // Success, exit retry loop
+
+      } catch(error) {
+        attempts++;
+        console.log(`❌ Transfer attempt ${attempts}/${maxAttempts} failed: ${error.message}`);
+
+        if(attempts >= maxAttempts) {
+          throw error; // Re-throw if all attempts failed
+        }
+
+        // Wait before retry
+        await new Promise(resolve => setTimeout(resolve,2000));
+      }
+    }
+
+    console.log(`✅ SOL transfer completed: ${signature}`);
+    await sendTelegramMessage(
+      `✅ SOL Transfer Completed!\n` +
+      `From: ${wallet.publicKey}\n` +
+      `To: ${config.walletAddress}\n` +
+      `Amount: ${amountSol.toFixed(6)} SOL\n` +
+      `Transaction: ${signature}`
+    );
+
+    return signature;
+  } catch(error) {
+    console.error(`❌ Failed to transfer SOL:`,error.message);
+    await sendTelegramMessage(`❌ SOL Transfer Failed for ${wallet.publicKey}: ${error.message}`);
+    throw error;
+  } finally {
+    // Always remove from transfer in progress
+    transferInProgress.delete(wallet.publicKey);
+  }
+}
+
+/**
+ * Close WSOL account by unwrapping it to SOL
+ */
+async function closeWsolAccount(wallet) {
+  try {
+    console.log(`🔄 Closing WSOL account for ${wallet.publicKey}...`);
+
+    // Get WSOL token accounts
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      wallet.keypair.publicKey,
+      {mint: new PublicKey(WSOL_MINT)}
+    );
+
+    const wsolAccounts = tokenAccounts.value.filter(account =>
+      account.account.data.parsed.info.tokenAmount.uiAmount > 0
+    );
+
+    if(wsolAccounts.length === 0) {
+      console.log(`ℹ️ No WSOL accounts found for ${wallet.publicKey}`);
+      return null;
+    }
+
+    console.log(`📊 Found ${wsolAccounts.length} WSOL account(s) to close`);
+
+    for(const account of wsolAccounts) {
+      const accountInfo = account.account.data.parsed.info;
+      const wsolAmount = accountInfo.tokenAmount.uiAmount;
+      const accountPubkey = account.pubkey;
+
+      console.log(`🔄 Closing WSOL account ${accountPubkey.toString()} with ${wsolAmount} WSOL`);
+
+      // Create close account instruction
+      const closeAccountInstruction = {
+        programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+        keys: [
+          {pubkey: accountPubkey,isSigner: false,isWritable: true},
+          {pubkey: wallet.keypair.publicKey,isSigner: true,isWritable: true},
+          {pubkey: wallet.keypair.publicKey,isSigner: true,isWritable: true},
+          {pubkey: SystemProgram.programId,isSigner: false,isWritable: false}
+        ],
+        data: Buffer.from([9]) // Close account instruction
+      };
+
+      // Create transaction
+      const transaction = new Transaction();
+      transaction.add(closeAccountInstruction);
+
+      // Get recent blockhash
+      const {blockhash} = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.keypair.publicKey;
+
+      // Sign the transaction
+      transaction.sign(wallet.keypair);
+
+      // Send the transaction with retry logic
+      let signature;
+      let attempts = 0;
+      const maxAttempts = 3;
+
+      while(attempts < maxAttempts) {
+        try {
+          signature = await connection.sendRawTransaction(transaction.serialize(),{
+            skipPreflight: false,
+            preflightCommitment: 'confirmed'
+          });
+
+          // Wait for confirmation
+          await connection.confirmTransaction(signature,'confirmed');
+          break; // Success, exit retry loop
+
+        } catch(error) {
+          attempts++;
+          console.log(`❌ WSOL close attempt ${attempts}/${maxAttempts} failed: ${error.message}`);
+
+          if(attempts >= maxAttempts) {
+            throw error; // Re-throw if all attempts failed
+          }
+
+          // Wait before retry
+          await new Promise(resolve => setTimeout(resolve,2000));
+        }
+      }
+
+      console.log(`✅ WSOL account closed: ${signature}`);
+      await sendTelegramMessage(
+        `✅ WSOL Account Closed!\n` +
+        `Wallet: ${wallet.publicKey}\n` +
+        `Account: ${accountPubkey.toString()}\n` +
+        `Amount: ${wsolAmount} WSOL\n` +
+        `Transaction: ${signature}`
+      );
+    }
+
+    return true;
+  } catch(error) {
+    console.error(`❌ Failed to close WSOL account:`,error.message);
+    await sendTelegramMessage(`❌ WSOL Account Close Failed for ${wallet.publicKey}: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * Check if token is valuable enough to sell (worth more than $1)
+ */
+function isValuableToken(token,prices) {
+  const price = prices[token.mint]?.usdPrice || 0;
+  const value = token.amount * price;
+  return value > 1; // Only sell tokens worth more than $1
+}
+
+/**
+ * Sell tokens only (without transferring SOL to another wallet)
+ */
+async function sellTokensOnly(walletData,wallet) {
+  console.log(`💱 Selling valuable tokens for ${wallet.publicKey}...`);
+
+  await sendTelegramMessage(
+    `💱 Token Sale Mode for ${wallet.publicKey}!\n` +
+    `Total wallet value: ${walletData.totalValueInSol.toFixed(4)} SOL\n` +
+    `Starting token sales...`
+  );
+
+  // Get original token data with decimals
+  const originalTokens = await getWalletTokenAccounts(wallet);
+  const tokenMap = new Map(originalTokens.map(t => [t.mint,t]));
+
+  // Get token prices for value assessment
+  const allMints = originalTokens.map(t => t.mint);
+  const prices = await getTokenPrices(allMints);
+
+  // Handle WSOL first - close WSOL accounts (skip in sell-only mode)
+  const wsolTokens = originalTokens.filter(token => token.mint === WSOL_MINT);
+  if(wsolTokens.length > 0 && !isSellOnlyMode) {
+    console.log(`🔄 Found WSOL tokens, closing WSOL accounts first...`);
+    try {
+      await closeWsolAccount(wallet);
+      // Wait a bit for the transaction to be fully processed
+      await new Promise(resolve => setTimeout(resolve,3000));
+    } catch(error) {
+      console.error(`❌ Failed to close WSOL accounts:`,error.message);
+      await sendTelegramMessage(`❌ WSOL Account Close Failed for ${wallet.publicKey}: ${error.message}`);
+    }
+  } else if(wsolTokens.length > 0 && isSellOnlyMode) {
+    console.log(`ℹ️ Found WSOL tokens but skipping closure in sell-only mode`);
+  }
+
+  // Sell other valuable tokens (excluding SOL and WSOL)
+  const tokensToSell = walletData.tokens.filter(token =>
+    token.symbol !== 'SOL' &&
+    token.mint !== WSOL_MINT &&
+    isValuableToken(token,prices)
+  );
+
+  console.log(`💱 Found ${tokensToSell.length} valuable tokens to sell`);
+
+  for(const token of tokensToSell) {
+    try {
+      // Get original token data with decimals
+      const originalToken = tokenMap.get(token.mint);
+      if(!originalToken) {
+        console.warn(`⚠️ Original token data not found for ${token.mint}`);
+        continue;
+      }
+
+      // Merge token data with decimals
+      const tokenWithDecimals = {
+        ...token,
+        decimals: originalToken.decimals
+      };
+
+      await sellToken(tokenWithDecimals,wallet);
+    } catch(error) {
+      console.error(`❌ Failed to sell ${token.symbol || token.mint}:`,error.message);
+      await sendTelegramMessage(`❌ Failed to sell ${token.symbol || token.mint} for ${wallet.publicKey}: ${error.message}`);
+    }
+  }
+
+  console.log(`✅ Token sale completed for ${wallet.publicKey}`);
+  await sendTelegramMessage(`✅ Token Sale Completed for ${wallet.publicKey}!`);
+}
+
+/**
+ * Sell tokens using Jupiter API when threshold is exceeded
+ */
+async function sellTokensIfNeeded(walletData,wallet) {
+  if(walletData.totalValueInSol <= config.thresholdSol) {
+    return;
+  }
+
+  console.log(`🎯 Threshold exceeded for ${wallet.publicKey}! Total value: ${walletData.totalValueInSol.toFixed(4)} SOL`);
+
+  await sendTelegramMessage(
+    `🚨 Threshold Exceeded for ${wallet.publicKey}!\n` +
+    `Total wallet value: ${walletData.totalValueInSol.toFixed(4)} SOL\n` +
+    `Threshold: ${config.thresholdSol} SOL\n` +
+    `Starting token sales...`
+  );
+
+  // Get original token data with decimals
+  const originalTokens = await getWalletTokenAccounts(wallet);
+  const tokenMap = new Map(originalTokens.map(t => [t.mint,t]));
+
+  // Get token prices for value assessment
+  const allMints = originalTokens.map(t => t.mint);
+  const prices = await getTokenPrices(allMints);
+
+  // Handle WSOL first - close WSOL accounts (skip in sell-only mode)
+  const wsolTokens = originalTokens.filter(token => token.mint === WSOL_MINT);
+  if(wsolTokens.length > 0 && !isSellOnlyMode) {
+    console.log(`🔄 Found WSOL tokens, closing WSOL accounts first...`);
+    try {
+      await closeWsolAccount(wallet);
+      // Wait a bit for the transaction to be fully processed
+      await new Promise(resolve => setTimeout(resolve,3000));
+    } catch(error) {
+      console.error(`❌ Failed to close WSOL accounts:`,error.message);
+      await sendTelegramMessage(`❌ WSOL Account Close Failed for ${wallet.publicKey}: ${error.message}`);
+    }
+  } else if(wsolTokens.length > 0 && isSellOnlyMode) {
+    console.log(`ℹ️ Found WSOL tokens but skipping closure in sell-only mode`);
+  }
+
+  // Sell other valuable tokens (excluding SOL and WSOL)
+  const tokensToSell = walletData.tokens.filter(token =>
+    token.symbol !== 'SOL' &&
+    token.mint !== WSOL_MINT &&
+    isValuableToken(token,prices)
+  );
+
+  console.log(`💱 Found ${tokensToSell.length} valuable tokens to sell`);
+
+  for(const token of tokensToSell) {
+    try {
+      // Get original token data with decimals
+      const originalToken = tokenMap.get(token.mint);
+      if(!originalToken) {
+        console.warn(`⚠️ Original token data not found for ${token.mint}`);
+        continue;
+      }
+
+      // Merge token data with decimals
+      const tokenWithDecimals = {
+        ...token,
+        decimals: originalToken.decimals
+      };
+
+      await sellToken(tokenWithDecimals,wallet);
+    } catch(error) {
+      console.error(`❌ Failed to sell ${token.symbol || token.mint}:`,error.message);
+      await sendTelegramMessage(`❌ Failed to sell ${token.symbol || token.mint} for ${wallet.publicKey}: ${error.message}`);
+    }
+  }
+
+  // After selling tokens, check if we need to transfer SOL to the wallet address
+  if(config.walletAddress) {
+    try {
+      // Get updated SOL balance after selling tokens
+      const updatedSolBalance = await getSolBalance(wallet);
+
+      if(updatedSolBalance > 0.01) { // Only transfer if we have more than 0.01 SOL (to cover fees)
+        // Transfer all SOL except a small amount for fees
+        const transferAmount = updatedSolBalance - 0.005; // Keep 0.005 SOL for fees
+
+        if(transferAmount > 0) {
+          console.log(`💸 Initiating SOL transfer after token sales...`);
+          await transferSolToWallet(wallet,transferAmount);
+        }
+      }
+    } catch(error) {
+      console.error(`❌ Failed to transfer SOL after token sales:`,error.message);
+      await sendTelegramMessage(`❌ SOL Transfer Failed after token sales for ${wallet.publicKey}: ${error.message}`);
+    }
+  }
+}
+
+/**
+ * Sell a specific token using Jupiter API
+ */
+async function sellToken(token,wallet) {
+  try {
+    console.log(`💱 Selling ${token.symbol || token.mint} for ${wallet.publicKey}...`);
+
+    // Get quote from Jupiter
+    const amountInSmallestUnit = Math.floor(token.amount * Math.pow(10,token.decimals || 9));
+    console.log(`💱 Token: ${token.symbol || token.mint}`);
+    console.log(`💱 Amount: ${token.amount} (decimals: ${token.decimals || 9})`);
+    console.log(`💱 Amount in smallest unit: ${amountInSmallestUnit}`);
+
+    const quoteUrl = `${config.jupiterApiUrl}/swap/v1/quote` +
+      `?inputMint=${token.mint}` +
+      `&outputMint=${SOL_MINT}` +
+      `&amount=${amountInSmallestUnit}` +
+      `&slippageBps=100`; // 1% slippage
+
+    const quoteResponse = await axios.get(quoteUrl);
+    const quote = quoteResponse.data;
+
+    // Get swap transaction
+    const swapResponse = await axios.post(`${config.jupiterApiUrl}/swap/v1/swap`,{
+      quoteResponse: quote,
+      userPublicKey: wallet.keypair.publicKey.toString(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: {
+          maxLamports: 1000000,
+          priorityLevel: "high"
+        }
+      }
+    });
+
+    const swapData = swapResponse.data;
+
+    // Sign and send the transaction with retry logic
+    console.log(`💱 Executing swap for ${token.symbol || token.mint}...`);
+
+    const result = await signAndSendTransaction(
+      connection,
+      wallet.keypair,
+      swapData.swapTransaction,
+      true, // Use versioned transaction
+      3 // Retry up to 3 times
+    );
+
+    if(result.error) {
+      throw new Error(`Transaction failed: ${result.error.message}`);
+    }
+
+    console.log(`🔄 Transaction sent: ${result.signature}`);
+    console.log(`⏳ Waiting for confirmation...`);
+
+    // Wait for transaction confirmation
+    await waitForTransactionConfirmation(connection,result.signature);
+
+    const estimatedSolReceived = (parseFloat(quote.outAmount) / 1e9).toFixed(6);
+
+    console.log(`✅ Token sale completed: ${token.symbol || token.mint}`);
+
+    await sendTelegramMessage(
+      `✅ Token Sale Completed for ${wallet.publicKey}!\n` +
+      `Token: ${token.symbol || token.mint}\n` +
+      `Amount Sold: ${token.amount.toFixed(6)}\n` +
+      `Estimated SOL Received: ${estimatedSolReceived}\n` +
+      `Transaction: ${result.signature}`
+    );
+
+  } catch(error) {
+    throw new Error(`Jupiter API error: ${error.message}`);
+  }
+}
+
+/**
+ * Main monitoring loop
+ */
+async function monitorWallet() {
+  if(isProcessing) {
+    console.log('⏳ Previous check still processing, skipping...');
+    return;
+  }
+
+  isProcessing = true;
+
+  try {
+    console.log(`\n🔍 Checking wallet balances... (${new Date().toLocaleString()})`);
+
+    for(const wallet of wallets) {
+      console.log(`\n🔍 Checking wallet: ${wallet.publicKey} (${wallet.fileName})`);
+      const walletData = await calculateWalletValue(wallet);
+
+      console.log(`💰 Total wallet value: $${walletData.totalValue.toFixed(2)} (${walletData.totalValueInSol.toFixed(4)} SOL)`);
+      console.log(`📊 SOL Balance: ${walletData.solBalance.toFixed(6)} SOL`);
+      console.log(`📈 SOL Price: $${walletData.solPrice.toFixed(2)}`);
+
+      // Check for balance changes
+      await checkBalanceChanges(walletData,wallet);
+
+      // Check if we need to sell tokens
+      if(isSellOnlyMode) {
+        // In sell-only mode, always try to sell tokens regardless of threshold
+        await sellTokensOnly(walletData,wallet);
+      } else {
+        // In monitor mode, only sell if threshold is exceeded
+        await sellTokensIfNeeded(walletData,wallet);
+      }
+
+      // Check if we need to transfer SOL directly (when wallet already has enough SOL)
+      // Only in monitor mode, not in sell-only mode
+      if(!isSellOnlyMode && config.walletAddress && walletData.solBalance > config.thresholdSol) {
+        try {
+          const transferAmount = walletData.solBalance - 0.005; // Keep 0.005 SOL for fees
+
+          if(transferAmount > 0) {
+            console.log(`💸 Wallet already has ${walletData.solBalance.toFixed(6)} SOL, transferring to ${config.walletAddress}...`);
+            const result = await transferSolToWallet(wallet,transferAmount);
+
+            // If transfer was successful, skip further processing for this wallet
+            if(result) {
+              console.log(`✅ SOL transfer completed for ${wallet.publicKey}, skipping further processing`);
+              continue; // Skip to next wallet
+            }
+          }
+        } catch(error) {
+          console.error(`❌ Failed to transfer SOL:`,error.message);
+          await sendTelegramMessage(`❌ SOL Transfer Failed for ${wallet.publicKey}: ${error.message}`);
+        }
+      }
+    }
+
+  } catch(error) {
+    console.error('❌ Error during wallet monitoring:',error.message);
+    await sendTelegramMessage(`❌ Monitoring Error: ${error.message}`);
+  } finally {
+    isProcessing = false;
+  }
+}
+
+/**
+ * Main function
+ */
+async function main() {
+  try {
+    await initialize();
+
+    if(isSellOnlyMode) {
+      // Sell-only mode: run once and exit
+      console.log('💱 Running token sale once...');
+      await monitorWallet();
+      console.log('✅ Token sale completed, exiting...');
+      process.exit(0);
+    } else {
+      // Monitor mode: continuous monitoring
+      console.log('🔄 Starting monitoring loop...');
+
+      // Run initial check
+      await monitorWallet();
+
+      // Set up recurring checks
+      setInterval(async () => {
+        await monitorWallet();
+      },config.checkIntervalMinutes * 60 * 1000);
+
+      console.log('✅ Wallet monitor is running...');
+    }
+
+  } catch(error) {
+    console.error('💥 Fatal error:',error.message);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGINT',async () => {
+  console.log('\n👋 Shutting down wallet monitor...');
+  await sendTelegramMessage('🛑 Wallet Monitor Stopped');
+  process.exit(0);
+});
+
+process.on('uncaughtException',async (error) => {
+  console.error('💥 Uncaught exception:',error.message);
+  await sendTelegramMessage(`💥 Critical Error: ${error.message}`);
+  process.exit(1);
+});
+
+// Start the application
+main();

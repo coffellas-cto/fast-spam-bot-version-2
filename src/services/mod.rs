@@ -3,3 +3,4 @@ pub mod rpc_client;
 pub mod cache_maintenance;
 pub mod zeroslot;
 pub mod token_monitor;
+pub mod jupiter;

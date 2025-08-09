@@ -15,7 +15,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{cache_maintenance, blockhash_processor::BlockhashProcessor},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, jupiter::JupiterClient},
     core::token,
 };
 use solana_program_pack::Pack;
@@ -27,6 +27,11 @@ use spl_token::instruction::sync_native;
 use spl_token::ui_amount_to_amount;
 use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::signal;
+
+// Global flag to track shutdown state
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the wallet token account list by fetching all token accounts owned by the wallet
 async fn initialize_token_account_list(config: &Config) {
@@ -352,11 +357,55 @@ async fn initialize_target_wallet_token_list(config: &Config, target_addresses: 
     Ok(())
 }
 
+/// Handle shutdown signals and sell all tokens before exiting
+async fn setup_signal_handlers(config: Arc<tokio::sync::Mutex<Config>>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            
+            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            
+            tokio::select! {
+                _ = sigint.recv() => {
+                    println!("\n🛑 Received SIGINT (Ctrl+C), selling all tokens before exit...");
+                },
+                _ = sigterm.recv() => {
+                    println!("\n🛑 Received SIGTERM, selling all tokens before exit...");
+                },
+            }
+        }
+        
+        #[cfg(windows)]
+        {
+            let mut ctrl_c = signal::ctrl_c();
+            ctrl_c.await.expect("Failed to install Ctrl+C handler");
+            println!("\n🛑 Received Ctrl+C, selling all tokens before exit...");
+        }
+        
+        // Set shutdown flag
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        
+        // Sell all tokens before shutdown
+        let config_guard = config.lock().await;
+        if let Err(e) = sell_all_tokens(&config_guard).await {
+            eprintln!("❌ Error selling tokens during shutdown: {}", e);
+        } else {
+            println!("✅ Successfully sold all tokens during shutdown");
+        }
+        
+        println!("👋 Shutting down...");
+        std::process::exit(0);
+    });
+}
+
 #[tokio::main]
 async fn main() {
     /* Initial Settings */
     let config = Config::new().await;
-    let config = config.lock().await;
+    let config_arc = Arc::new(config);
+    let config = config_arc.lock().await;
 
     /* Running Bot */
     let run_msg = RUN_MSG;
@@ -436,6 +485,19 @@ async fn main() {
             let summary = token_monitor.get_tracking_summary();
             println!("{}", summary);
             return;
+        } else if args.contains(&"--sell".to_string()) {
+            println!("💱 Selling all token holdings...");
+            
+            match sell_all_tokens(&config).await {
+                Ok(_) => {
+                    println!("✅ Successfully sold all token holdings");
+                    return;
+                },
+                Err(e) => {
+                    eprintln!("❌ Failed to sell all token holdings: {}", e);
+                    return;
+                }
+            }
         }
     }
 
@@ -497,6 +559,9 @@ async fn main() {
         eprintln!("Failed to initialize target wallet token list: {}", e);
         return;
     }
+    
+    // Set up signal handlers for graceful shutdown with token selling
+    setup_signal_handlers(config_arc.clone()).await;
     
     // Get protocol preference from environment
     let protocol_preference = std::env::var("PROTOCOL_PREFERENCE")
