@@ -371,7 +371,7 @@ async fn sell_all_tokens(config: &Config) -> Result<(), String> {
     
     // Sell all tokens
     match jupiter_client.sell_all_tokens(
-        &config.app_state.rpc_client,
+        &config.app_state.rpc_nonblocking_client,
         wallet_keypair,
         Some(100), // 1% slippage
     ).await {
