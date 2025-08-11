@@ -57,7 +57,7 @@ use solana_vntr_sniper::{
 };
 use solana_program_pack::Pack;
 use anchor_client::solana_sdk::pubkey::Pubkey;
-use anchor_client::solana_sdk::transaction::Transaction;
+use anchor_client::solana_sdk::transaction::{Transaction, VersionedTransaction};
 use anchor_client::solana_sdk::system_instruction;
 use std::str::FromStr;
 use colored::Colorize;
@@ -729,6 +729,8 @@ async fn execute_swap_transaction(
     
     // Try to deserialize as legacy transaction first (more compatible)
     if let Ok(mut transaction) = bincode::deserialize::<Transaction>(&transaction_bytes) {
+        logger.log("Processing as legacy transaction".to_string());
+        
         // Get recent blockhash
         let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
             .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
@@ -781,11 +783,78 @@ async fn execute_swap_transaction(
                 }
             }
         }
+    } else if let Ok(mut transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+        logger.log("Processing as versioned transaction".to_string());
+        
+        // Get recent blockhash
+        let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
+            .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+        
+        // Update the transaction's blockhash
+        transaction.message.set_recent_blockhash(recent_blockhash);
+        
+        // Sign the versioned transaction
+        let message_data = transaction.message.serialize();
+        let signature = config.app_state.wallet.sign_message(&message_data);
+        
+        // Find the position of the keypair in the account keys to place the signature
+        let account_keys = transaction.message.static_account_keys();
+        if let Some(signer_index) = account_keys.iter().position(|key| *key == config.app_state.wallet.pubkey()) {
+            // Ensure we have enough signatures
+            if transaction.signatures.len() <= signer_index {
+                transaction.signatures.resize(signer_index + 1, anchor_client::solana_sdk::signature::Signature::default());
+            }
+            transaction.signatures[signer_index] = signature;
+        } else {
+            return Err("Wallet not found in transaction account keys".to_string());
+        }
+        
+        // Send the transaction with retry logic
+        let mut attempts = 0;
+        let max_attempts = 3;
+        
+        while attempts < max_attempts {
+            attempts += 1;
+            
+            // Send the transaction
+            match config.app_state.rpc_client.send_transaction(&transaction) {
+                Ok(signature) => {
+                    logger.log(format!("Versioned swap transaction sent: {}", signature));
+                    
+                    // Wait for confirmation
+                    for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        
+                        if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
+                            if let Some(result) = status {
+                                if result.is_ok() {
+                                    logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                    return Ok(signature.to_string());
+                                } else {
+                                    return Err(format!("Transaction failed: {:?}", result));
+                                }
+                            }
+                        }
+                    }
+                    
+                    return Err("Transaction confirmation timeout".to_string());
+                },
+                Err(e) => {
+                    logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                    
+                    if attempts >= max_attempts {
+                        return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                    }
+                    
+                    // Wait before retry
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
     } else {
-        // If Jupiter returns versioned transactions, we need to handle them differently
-        // For now, return an error since the existing codebase uses legacy transactions
-        logger.log("Transaction format not supported - expected legacy transaction".yellow().to_string());
-        return Err("Unsupported transaction format - only legacy transactions are supported".to_string());
+        // If Jupiter returns neither transaction format, return an error
+        logger.log("Transaction format not supported - unable to deserialize as legacy or versioned transaction".yellow().to_string());
+        return Err("Unsupported transaction format - unable to deserialize as legacy or versioned transaction".to_string());
     }
     
     Err("Maximum retry attempts exceeded".to_string())
