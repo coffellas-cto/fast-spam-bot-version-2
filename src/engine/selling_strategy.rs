@@ -593,7 +593,7 @@ impl SimpleSellingEngine {
 
     /// Verify buy transaction and cache the resulting balance for fast selling
     async fn verify_and_cache_balance(&self, mint: &str, ata: &Pubkey) -> Result<()> {
-        self.logger.log(format!("Verifying and caching balance for token: {}", mint).blue().to_string());
+        self.logger.log(format!("Verifying and caching balance for token: {} (account: {})", mint, ata).blue().to_string());
         
         // Wait a bit for transaction to settle
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -605,45 +605,89 @@ impl SimpleSellingEngine {
         loop {
             attempts += 1;
             
-            // Get token account to cache balance
-            match self.app_state.rpc_nonblocking_client.get_token_account(ata).await {
-                Ok(Some(account)) => {
-                    let amount_raw = account.token_amount.amount.parse::<u64>()
-                        .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
-                    let decimal_amount = account.token_amount.amount.parse::<f64>()
-                        .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?
-                        / 10f64.powi(account.token_amount.decimals as i32);
-                    let decimals = account.token_amount.decimals;
+            // First check if the account exists at all
+            match self.app_state.rpc_nonblocking_client.get_account_info(ata).await {
+                Ok(Some(account_info)) => {
+                    self.logger.log(format!("Account {} exists, owner: {}, data length: {}", 
+                        ata, account_info.owner, account_info.data.len()).cyan().to_string());
                     
-                    // Cache the verified balance
-                    BOUGHT_TOKENS.cache_verified_balance(mint, amount_raw, decimal_amount, decimals);
-                    self.logger.log(format!("Cached verified balance for {}: {} tokens ({} raw units)", 
-                        mint, decimal_amount, amount_raw).green().to_string());
-                    
-                    return Ok(());
+                    // Now try to get it as a token account
+                    match self.app_state.rpc_nonblocking_client.get_token_account(ata).await {
+                        Ok(Some(account)) => {
+                            let amount_raw = account.token_amount.amount.parse::<u64>()
+                                .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
+                            let decimal_amount = account.token_amount.amount.parse::<f64>()
+                                .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?
+                                / 10f64.powi(account.token_amount.decimals as i32);
+                            let decimals = account.token_amount.decimals;
+                            
+                            // Cache the verified balance
+                            BOUGHT_TOKENS.cache_verified_balance(mint, amount_raw, decimal_amount, decimals);
+                            
+                            // Also add the account to the wallet token accounts cache
+                            crate::common::cache::WALLET_TOKEN_ACCOUNTS.insert(*ata);
+                            
+                            self.logger.log(format!("Cached verified balance for {}: {} tokens ({} raw units)", 
+                                mint, decimal_amount, amount_raw).green().to_string());
+                            
+                            return Ok(());
+                        },
+                        Ok(None) => {
+                            if attempts < MAX_ATTEMPTS {
+                                self.logger.log(format!("Account {} exists but not as token account for {} (attempt {}/{}), retrying in 2s...", 
+                                    ata, mint, attempts, MAX_ATTEMPTS).yellow().to_string());
+                                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                                continue;
+                            } else {
+                                let error_msg = format!("Account {} exists but cannot be parsed as token account for {} after {} attempts", ata, mint, MAX_ATTEMPTS);
+                                self.logger.log(error_msg.clone().red().to_string());
+                                // Remove the token from tracking since verification failed
+                                BOUGHT_TOKENS.remove_token(mint);
+                                return Err(anyhow!(error_msg));
+                            }
+                        },
+                        Err(e) => {
+                            if attempts < MAX_ATTEMPTS {
+                                self.logger.log(format!("Failed to parse account {} as token account for {} (attempt {}/{}): {}, retrying in 2s...", 
+                                    ata, mint, attempts, MAX_ATTEMPTS, e).yellow().to_string());
+                                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                                continue;
+                            } else {
+                                let error_msg = format!("Failed to parse account {} as token account for {} after {} attempts: {}", ata, mint, MAX_ATTEMPTS, e);
+                                self.logger.log(error_msg.clone().red().to_string());
+                                // Remove the token from tracking since verification failed
+                                BOUGHT_TOKENS.remove_token(mint);
+                                return Err(anyhow!(error_msg));
+                            }
+                        }
+                    }
                 },
                 Ok(None) => {
                     if attempts < MAX_ATTEMPTS {
-                        self.logger.log(format!("Token account not found for {} (attempt {}/{}), retrying in 2s...", 
-                            mint, attempts, MAX_ATTEMPTS).yellow().to_string());
+                        self.logger.log(format!("Account {} not found for {} (attempt {}/{}), retrying in 2s...", 
+                            ata, mint, attempts, MAX_ATTEMPTS).yellow().to_string());
                         tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
                         continue;
                     } else {
-                        self.logger.log(format!("Token account not found for {} after {} attempts, balance cache skipped", 
-                            mint, MAX_ATTEMPTS).yellow().to_string());
-                        return Ok(());
+                        let error_msg = format!("Account {} not found for {} after {} attempts", ata, mint, MAX_ATTEMPTS);
+                        self.logger.log(error_msg.clone().red().to_string());
+                        // Remove the token from tracking since verification failed
+                        BOUGHT_TOKENS.remove_token(mint);
+                        return Err(anyhow!(error_msg));
                     }
                 },
                 Err(e) => {
                     if attempts < MAX_ATTEMPTS {
-                        self.logger.log(format!("Failed to verify balance for {} (attempt {}/{}): {}, retrying in 2s...", 
-                            mint, attempts, MAX_ATTEMPTS, e).yellow().to_string());
+                        self.logger.log(format!("Failed to get account info for {} (account: {}) (attempt {}/{}): {}, retrying in 2s...", 
+                            mint, ata, attempts, MAX_ATTEMPTS, e).yellow().to_string());
                         tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
                         continue;
                     } else {
-                        self.logger.log(format!("Failed to verify balance for {} after {} attempts: {}", 
-                            mint, MAX_ATTEMPTS, e).yellow().to_string());
-                        return Ok(()); // Don't fail the whole buy process if balance verification fails
+                        let error_msg = format!("Failed to get account info for {} (account: {}) after {} attempts: {}", mint, ata, MAX_ATTEMPTS, e);
+                        self.logger.log(error_msg.clone().red().to_string());
+                        // Remove the token from tracking since verification failed
+                        BOUGHT_TOKENS.remove_token(mint);
+                        return Err(anyhow!(error_msg));
                     }
                 }
             }

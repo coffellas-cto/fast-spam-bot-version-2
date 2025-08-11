@@ -346,6 +346,18 @@ impl PumpSwap {
             self.cache_token_account(out_ata).await;
         }
         
+        // Check if WSOL account exists for buying
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        if !self.check_token_account_cache(wsol_ata).await {
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+            self.cache_token_account(wsol_ata).await;
+        }
+        
         // Create accounts using parsed pool_id and coin_creator
         let pool_base_account = get_associated_token_address(&pool_id, &mint);
         let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);

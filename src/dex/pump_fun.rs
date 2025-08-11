@@ -13,7 +13,7 @@ use anchor_client::solana_sdk::{
     system_program,
 };
 use spl_associated_token_account::{
-    get_associated_token_address, instruction::create_associated_token_account,
+    get_associated_token_address, instruction::create_associated_token_account_idempotent,
 };
 use spl_token::{ui_amount_to_amount};
 use tokio::sync::OnceCell;
@@ -243,7 +243,7 @@ impl Pump {
         if swap_config.swap_direction == SwapDirection::Buy {
             // Check if token account exists using cache first
             if !self.check_token_account_cache(out_ata).await {
-                create_instruction = Some(create_associated_token_account(
+                create_instruction = Some(create_associated_token_account_idempotent(
                     &owner,
                     &owner,
                     &token_out,
@@ -251,6 +251,35 @@ impl Pump {
                 ));
                 // Cache the new account
                 self.cache_token_account(out_ata).await;
+            }
+            
+            // Check if WSOL account exists for buying
+            let wsol_ata = get_associated_token_address(&owner, &token_in); // token_in is SOL for buy
+            if !self.check_token_account_cache(wsol_ata).await {
+                if create_instruction.is_some() {
+                    // If we already have a create instruction, we need to add both
+                    let mut instructions_vec = vec![create_instruction.unwrap()];
+                    instructions_vec.push(create_associated_token_account_idempotent(
+                        &owner,
+                        &owner,
+                        &token_in,
+                        &token_program_id,
+                    ));
+                    create_instruction = None; // Will be added differently below
+                    // Add both instructions to the main instruction list
+                    for instruction in instructions_vec {
+                        instructions.push(instruction);
+                    }
+                } else {
+                    create_instruction = Some(create_associated_token_account_idempotent(
+                        &owner,
+                        &owner,
+                        &token_in,
+                        &token_program_id,
+                    ));
+                }
+                // Cache the new WSOL account
+                self.cache_token_account(wsol_ata).await;
             }
         } else {
             // For sell, check if we have tokens to sell using cache first
@@ -417,7 +446,7 @@ impl Pump {
         if swap_config.swap_direction == SwapDirection::Buy {
             // Check if token account exists using cache first
             if !self.check_token_account_cache(out_ata).await {
-                create_instruction = Some(create_associated_token_account(
+                create_instruction = Some(create_associated_token_account_idempotent(
                     &owner,
                     &owner,
                     &token_out,
