@@ -98,8 +98,47 @@ struct JupiterQuoteResponse {
     swap_mode: String,
     #[serde(rename = "slippageBps")]
     slippage_bps: u16,
+    #[serde(rename = "platformFee")]
+    platform_fee: Option<PlatformFeeInfo>,
     #[serde(rename = "priceImpactPct")]
     price_impact_pct: Option<String>,
+    #[serde(rename = "routePlan")]
+    route_plan: Vec<RoutePlanEntry>,
+    #[serde(rename = "contextSlot")]
+    context_slot: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PlatformFeeInfo {
+    amount: String,
+    #[serde(rename = "feeBps")]
+    fee_bps: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RoutePlanEntry {
+    #[serde(rename = "swapInfo")]
+    swap_info: SwapInfoEntry,
+    percent: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SwapInfoEntry {
+    label: String,
+    #[serde(rename = "ammKey")]
+    amm_key: String,
+    #[serde(rename = "inputMint")]
+    input_mint: String,
+    #[serde(rename = "outputMint")]
+    output_mint: String,
+    #[serde(rename = "inAmount")]
+    in_amount: String,
+    #[serde(rename = "outAmount")]
+    out_amount: String,
+    #[serde(rename = "feeAmount")]
+    fee_amount: String,
+    #[serde(rename = "feeMint")]
+    fee_mint: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -608,9 +647,15 @@ async fn get_jupiter_quote(
         return Err(format!("Quote API returned status: {} - {}", status, error_text));
     }
     
-    let quote: JupiterQuoteResponse = response.json()
-        .await
-        .map_err(|e| format!("Failed to parse quote response: {}", e))?;
+    // Log the raw response for debugging
+    let response_text = response.text().await
+        .map_err(|e| format!("Failed to read response text: {}", e))?;
+    logger.log(format!("Raw quote response (first 500 chars): {}", 
+        &response_text[..std::cmp::min(500, response_text.len())]));
+    
+    let quote: JupiterQuoteResponse = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Failed to parse quote response: {}. Response: {}", e, 
+            &response_text[..std::cmp::min(200, response_text.len())]))?;
     
     logger.log(format!("Quote received: {} {} -> {} {}", 
                      quote.in_amount, input_mint, quote.out_amount, output_mint));
@@ -627,7 +672,7 @@ async fn get_jupiter_swap_transaction(
     logger.log("Getting swap transaction from Jupiter".to_string());
     
     let client = reqwest::Client::new();
-    let url = format!("{}/v6/swap", JUPITER_API_URL);
+    let url = "https://api.jup.ag/swap/v1/swap";
     
     let swap_request = JupiterSwapRequest {
         quote_response: quote,
@@ -642,7 +687,14 @@ async fn get_jupiter_swap_transaction(
         },
     };
     
-    let response = client.post(&url)
+    // Log the request for debugging
+    logger.log(format!("Sending swap request to: {}", url));
+    logger.log(format!("Request payload (first 300 chars): {}", 
+        serde_json::to_string(&swap_request)
+            .unwrap_or_else(|_| "Failed to serialize".to_string())
+            .chars().take(300).collect::<String>()));
+    
+    let response = client.post(url)
         .json(&swap_request)
         .send()
         .await
@@ -651,6 +703,7 @@ async fn get_jupiter_swap_transaction(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
+        logger.log(format!("Jupiter swap API error: Status {}, Response: {}", status, error_text));
         return Err(format!("Swap API returned status: {} - {}", status, error_text));
     }
     

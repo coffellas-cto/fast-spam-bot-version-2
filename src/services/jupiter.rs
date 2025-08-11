@@ -10,12 +10,13 @@ use anchor_client::solana_sdk::{
     transaction::VersionedTransaction,
 };
 use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
-use base64;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use tokio::time::Duration;
 
 use crate::common::logger::Logger;
 
 const JUPITER_API_URL: &str = "https://quote-api.jup.ag/v6";
+const JUPITER_SWAP_API_URL: &str = "https://api.jup.ag/swap/v1";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Serialize)]
@@ -45,8 +46,47 @@ struct QuoteResponse {
     pub swap_mode: String,
     #[serde(rename = "slippageBps")]
     pub slippage_bps: u64,
+    #[serde(rename = "platformFee")]
+    pub platform_fee: Option<PlatformFee>,
     #[serde(rename = "priceImpactPct")]
     pub price_impact_pct: String,
+    #[serde(rename = "routePlan")]
+    pub route_plan: Vec<RoutePlanInfo>,
+    #[serde(rename = "contextSlot")]
+    pub context_slot: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformFee {
+    pub amount: String,
+    #[serde(rename = "feeBps")]
+    pub fee_bps: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutePlanInfo {
+    #[serde(rename = "swapInfo")]
+    pub swap_info: SwapInfo,
+    pub percent: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapInfo {
+    pub label: String,
+    #[serde(rename = "ammKey")]
+    pub amm_key: String,
+    #[serde(rename = "inputMint")]
+    pub input_mint: String,
+    #[serde(rename = "outputMint")]
+    pub output_mint: String,
+    #[serde(rename = "inAmount")]
+    pub in_amount: String,
+    #[serde(rename = "outAmount")]
+    pub out_amount: String,
+    #[serde(rename = "feeAmount")]
+    pub fee_amount: String,
+    #[serde(rename = "feeMint")]
+    pub fee_mint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,7 +179,12 @@ impl JupiterClient {
             return Err(anyhow!("Jupiter quote API error: {}", error_text));
         }
 
-        let quote: QuoteResponse = response.json().await?;
+        // Log the raw response for debugging
+        let response_text = response.text().await?;
+        self.logger.log(format!("Raw quote response: {}", &response_text[..std::cmp::min(500, response_text.len())]));
+        
+        let quote: QuoteResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Failed to parse quote response: {}. Response: {}", e, &response_text[..std::cmp::min(200, response_text.len())]))?;
         
         self.logger.log(format!("Jupiter quote received: {} {} -> {} {} (price impact: {}%)", 
             quote.in_amount, input_mint, quote.out_amount, output_mint, quote.price_impact_pct));
@@ -168,7 +213,12 @@ impl JupiterClient {
             },
         };
 
-        let url = format!("{}/swap", JUPITER_API_URL);
+        let url = format!("{}/swap", JUPITER_SWAP_API_URL);
+        
+        // Log the request for debugging
+        self.logger.log(format!("Sending swap request to: {}", url));
+        self.logger.log(format!("Request payload: {}", serde_json::to_string_pretty(&swap_request).unwrap_or_else(|_| "Failed to serialize".to_string())));
+        
         let response = self.client
             .post(&url)
             .json(&swap_request)
@@ -176,14 +226,16 @@ impl JupiterClient {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!("Jupiter swap API error: {}", error_text));
+            self.logger.log(format!("Jupiter swap API error: Status {}, Response: {}", status, error_text).red().to_string());
+            return Err(anyhow!("Swap API returned status: {} - {}", status, error_text));
         }
 
         let swap_response: SwapResponse = response.json().await?;
         
         // Decode the base64 transaction
-        let transaction_bytes = base64::decode(&swap_response.swap_transaction)?;
+        let transaction_bytes = BASE64_STANDARD.decode(&swap_response.swap_transaction)?;
         let transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)?;
 
         self.logger.log("Jupiter swap transaction received and decoded successfully".to_string());
@@ -199,9 +251,11 @@ impl JupiterClient {
         slippage_bps: u64,
         keypair: &Keypair,
     ) -> Result<String> {
-        self.logger.log(format!("Starting Jupiter sell for token {} (amount: {})", token_mint, token_amount));
+        self.logger.log(format!("Starting Jupiter sell for token {} (amount: {}, slippage: {}bps)", 
+            token_mint, token_amount, slippage_bps));
 
         // Get quote
+        self.logger.log("Getting Jupiter quote...".to_string());
         let quote = self.get_quote(
             token_mint,
             SOL_MINT,
@@ -209,6 +263,8 @@ impl JupiterClient {
             slippage_bps,
         ).await?;
 
+        self.logger.log(format!("Quote received, getting swap transaction..."));
+        
         // Get swap transaction
         let mut transaction = self.get_swap_transaction(quote, &keypair.pubkey()).await?;
 
