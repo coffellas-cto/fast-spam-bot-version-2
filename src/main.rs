@@ -672,7 +672,7 @@ async fn get_jupiter_swap_transaction(
     logger.log("Getting swap transaction from Jupiter".to_string());
     
     let client = reqwest::Client::new();
-    let url = "https://api.jup.ag/swap/v1/swap";
+    let url = "https://lite-api.jup.ag/swap/v1/swap";
     
     let swap_request = JupiterSwapRequest {
         quote_response: quote,
