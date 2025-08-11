@@ -234,7 +234,7 @@ impl JupiterClient {
         let swap_response: SwapResponse = response.json().await?;
         
         // Decode the base64 transaction
-        let transaction_bytes = BASE64_STANDARD.decode(&swap_response.swap_transaction)?;
+        let transaction_bytes = base64::decode(&swap_response.swap_transaction)?;
         let transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)?;
 
         self.logger.log("Jupiter swap transaction received and decoded successfully".to_string());
