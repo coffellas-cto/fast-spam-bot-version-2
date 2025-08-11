@@ -335,18 +335,21 @@ impl PumpSwap {
         let max_quote_amount_in = max_amount_with_slippage(amount_specified, slippage_bps);
         let out_ata = get_associated_token_address(&owner, &mint);
         
+        // Get the correct token program for the mint
+        let token_program = self.get_token_program(&mint).await.unwrap_or(*TOKEN_PROGRAM);
+        
         // Check token account existence without RPC call if possible
         if !self.check_token_account_cache(out_ata).await {
             instructions.push(create_associated_token_account_idempotent(
                 &owner,
                 &owner,
                 &mint,
-                &TOKEN_PROGRAM,
+                &token_program,
             ));
             self.cache_token_account(out_ata).await;
         }
         
-        // Check if WSOL account exists for buying
+        // Check if WSOL account exists for buying (WSOL always uses TOKEN_PROGRAM)
         let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
         if !self.check_token_account_cache(wsol_ata).await {
             instructions.push(create_associated_token_account_idempotent(
@@ -561,6 +564,28 @@ impl PumpSwap {
     
     async fn cache_token_account(&self, account: Pubkey) {
         WALLET_TOKEN_ACCOUNTS.insert(account);
+    }
+    
+    /// Helper method to determine the correct token program for a mint
+    async fn get_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        if let Some(rpc_client) = &self.rpc_client {
+            match rpc_client.get_account(mint) {
+                Ok(account) => {
+                    if account.owner == *TOKEN_2022_PROGRAM {
+                        Ok(*TOKEN_2022_PROGRAM)
+                    } else {
+                        Ok(*TOKEN_PROGRAM)
+                    }
+                },
+                Err(_) => {
+                    // Default to TOKEN_PROGRAM if we can't fetch the account
+                    Ok(*TOKEN_PROGRAM)
+                }
+            }
+        } else {
+            // Default to TOKEN_PROGRAM if no RPC client
+            Ok(*TOKEN_PROGRAM)
+        }
     }
 
     /// Calculate token amount out for buy using virtual reserves (PumpSwap AMM formula)

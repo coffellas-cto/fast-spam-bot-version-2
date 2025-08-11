@@ -183,7 +183,7 @@ impl Raydium {
                 &owner,
                 &owner,
                 &mint,
-                &TOKEN_PROGRAM, // Always use legacy token program for ATA creation
+                &token_program, // Use correct token program for the mint
             ));
         }
         

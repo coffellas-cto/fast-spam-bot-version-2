@@ -89,6 +89,28 @@ impl Pump {
     async fn cache_token_account(&self, account: Pubkey) {
         WALLET_TOKEN_ACCOUNTS.insert(account);
     }
+    
+    /// Helper method to determine the correct token program for a mint
+    async fn get_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        if let Some(rpc_client) = &self.rpc_client {
+            match rpc_client.get_account(mint) {
+                Ok(account) => {
+                    if account.owner.to_string() == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
+                        Ok(Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")?)
+                    } else {
+                        Ok(Pubkey::from_str(TOKEN_PROGRAM)?)
+                    }
+                },
+                Err(_) => {
+                    // Default to TOKEN_PROGRAM if we can't fetch the account
+                    Ok(Pubkey::from_str(TOKEN_PROGRAM)?)
+                }
+            }
+        } else {
+            // Default to TOKEN_PROGRAM if no RPC client
+            Ok(Pubkey::from_str(TOKEN_PROGRAM)?)
+        }
+    }
 
     pub async fn get_token_price(&self, mint_str: &str) -> Result<f64> {
         // For PumpFun, we'll use a fallback method since we don't have trade_info here
@@ -203,7 +225,10 @@ impl Pump {
         // Extract the essential data
         let mint_str = &trade_info.mint;
         let owner = self.keypair.pubkey();
-        let token_program_id = Pubkey::from_str(TOKEN_PROGRAM)?;
+        let mint = Pubkey::from_str(mint_str)?;
+        
+        // Get the correct token program for the mint
+        let token_program_id = self.get_token_program(&mint).await.unwrap_or(Pubkey::from_str(TOKEN_PROGRAM)?);
         let native_mint = spl_token::native_mint::ID;
         let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
 
@@ -211,8 +236,8 @@ impl Pump {
         _logger.log("Using trade_info.price for calculations".to_string());
         
         // Get bonding curve account addresses (we still need these for the transaction)
-        let bonding_curve = get_pda(&Pubkey::from_str(mint_str)?, &pump_program)?;
-        let associated_bonding_curve = get_associated_token_address(&bonding_curve, &Pubkey::from_str(mint_str)?);
+        let bonding_curve = get_pda(&mint, &pump_program)?;
+        let associated_bonding_curve = get_associated_token_address(&bonding_curve, &mint);
 
         // Get volume accumulator PDAs
         let global_volume_accumulator = get_global_volume_accumulator_pda(&pump_program)?;
@@ -220,8 +245,8 @@ impl Pump {
 
         // Determine if this is a buy or sell operation
         let (token_in, token_out, pump_method) = match swap_config.swap_direction {
-            SwapDirection::Buy => (native_mint, Pubkey::from_str(mint_str)?, PUMP_BUY_METHOD),
-            SwapDirection::Sell => (Pubkey::from_str(mint_str)?, native_mint, PUMP_SELL_METHOD),
+            SwapDirection::Buy => (native_mint, mint, PUMP_BUY_METHOD),
+            SwapDirection::Sell => (mint, native_mint, PUMP_SELL_METHOD),
         };
         
         // Calculate price using virtual reserves from trade_info
@@ -255,14 +280,14 @@ impl Pump {
                 self.cache_token_account(out_ata).await;
             }
             
-            // Check if WSOL account exists for buying
+            // Check if WSOL account exists for buying (WSOL always uses TOKEN_PROGRAM)
             let wsol_ata = get_associated_token_address(&owner, &token_in); // token_in is SOL for buy
             if !self.check_token_account_cache(wsol_ata).await {
                 let wsol_create_instruction = create_associated_token_account_idempotent(
                     &owner,
                     &owner,
                     &token_in,
-                    &token_program_id,
+                    &Pubkey::from_str(TOKEN_PROGRAM)?,
                 );
                 additional_instructions.push(wsol_create_instruction);
                 // Cache the new WSOL account
