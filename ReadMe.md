@@ -135,3 +135,54 @@ Once started, the bot will:
 ## Contact
 
 For questions or support, please contact the developer.
+
+## Risk Management System
+
+The bot includes an automated risk management system that monitors target wallet token balances and automatically sells all held tokens when risk thresholds are met.
+
+### How It Works
+
+1. **Every 10 minutes** (configurable), the system checks:
+   - All currently held tokens (from the bought tokens list)
+   - Target wallet balances for each held token
+
+2. **Risk Threshold**: If any target wallet has **less than 1000 tokens** (configurable) of any held token, the system triggers:
+   - Immediate sale of **ALL** held tokens using Jupiter API
+   - Cache clearing and system reset
+   - Automatic resumption of monitoring
+
+3. **Jupiter Integration**: Uses Jupiter Swap API for optimal token sales:
+   - Gets quotes with 1% slippage tolerance
+   - Builds and executes swap transactions
+   - Confirms transaction completion
+
+### Configuration
+
+Set these environment variables to customize risk management:
+
+```bash
+# Enable/disable risk management (default: true)
+RISK_MANAGEMENT_ENABLED=true
+
+# Token threshold for triggering sells (default: 1000)
+RISK_TARGET_TOKEN_THRESHOLD=1000
+
+# Check interval in minutes (default: 10)
+RISK_CHECK_INTERVAL_MINUTES=10
+```
+
+### Risk Management Logs
+
+The system provides detailed logging with `[RISK-MANAGEMENT]` prefix:
+- Regular balance checks and status updates
+- Risk alerts when thresholds are met
+- Detailed sell transaction progress
+- Cache clearing confirmations
+
+### Safety Features
+
+- **Multiple target support**: Checks all configured target addresses
+- **Error handling**: Treats RPC errors as potential risks
+- **Transaction retry**: Up to 3 attempts for failed swaps
+- **Confirmation waiting**: Waits up to 30 seconds for transaction confirmation
+- **Rate limiting**: 1-second delays between swaps to avoid API limits

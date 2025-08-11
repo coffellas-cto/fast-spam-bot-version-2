@@ -1,5 +1,5 @@
 /*
- * Copy Trading Bot with PumpSwap Notification Mode and Jupiter Integration
+ * Copy Trading Bot with PumpSwap Notification Mode, Jupiter Integration, and Risk Management
  * 
  * Features:
  * - Modified PumpSwap buy/sell logic to only send notifications without executing transactions
@@ -8,14 +8,16 @@
  * - PumpFun protocol functionality remains unchanged
  * - Added caching and batch RPC calls for improved performance
  * - Added --sell command to sell all holding tokens using Jupiter API
+ * - NEW: Automated risk management system with target wallet monitoring
  * 
  * Usage Commands:
  * - cargo run -- --wrap       : Wrap SOL to WSOL (amount from WRAP_AMOUNT env var)
  * - cargo run -- --unwrap     : Unwrap WSOL back to SOL
  * - cargo run -- --close      : Close all empty token accounts
- * - cargo run -- --sell       : Sell all holding tokens using Jupiter API (NEW!)
+ * - cargo run -- --sell       : Sell all holding tokens using Jupiter API
  * - cargo run -- --check-tokens : Check token tracking status
- * - cargo run                  : Start copy trading bot
+ * - cargo run -- --risk-check : Run manual risk management check (NEW!)
+ * - cargo run                  : Start copy trading bot with risk management
  * 
  * Jupiter API Integration:
  * The --sell command performs the following operations:
@@ -31,7 +33,16 @@
  * 
  * Environment Variables:
  * - WRAP_AMOUNT: Amount of SOL to wrap (default: 0.1)
+ * - RISK_MANAGEMENT_ENABLED: Enable/disable risk management (default: true)
+ * - RISK_TARGET_TOKEN_THRESHOLD: Token threshold for risk alerts (default: 1000)
+ * - RISK_CHECK_INTERVAL_MINUTES: Risk check interval in minutes (default: 10)
  * - Standard bot configuration variables (RPC URLs, wallet keys, etc.)
+ * 
+ * Risk Management:
+ * The bot automatically monitors target wallet token balances every 10 minutes.
+ * If any target wallet has less than 1000 tokens (configurable) of any held token,
+ * the system automatically sells ALL held tokens using Jupiter API, clears caches,
+ * and resumes monitoring. This protects against following wallets that dump tokens.
  */
 
 use anchor_client::solana_sdk::signature::Signer;
@@ -41,7 +52,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{cache_maintenance, blockhash_processor::BlockhashProcessor},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService},
     core::token,
 };
 use solana_program_pack::Pack;
@@ -951,6 +962,53 @@ async fn main() {
                     return;
                 }
             }
+        } else if args.contains(&"--risk-check".to_string()) {
+            println!("Running manual risk management check...");
+            
+            // Get target addresses
+            let copy_trading_target_address = std::env::var("COPY_TRADING_TARGET_ADDRESS").ok();
+            let is_multi_copy_trading = std::env::var("IS_MULTI_COPY_TRADING")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(false);
+            
+            let mut target_addresses = Vec::new();
+            
+            if is_multi_copy_trading {
+                if let Some(address_str) = copy_trading_target_address {
+                    for addr in address_str.split(',') {
+                        let trimmed_addr = addr.trim();
+                        if !trimmed_addr.is_empty() {
+                            target_addresses.push(trimmed_addr.to_string());
+                        }
+                    }
+                }
+            } else if let Some(address) = copy_trading_target_address {
+                if !address.is_empty() {
+                    target_addresses.push(address);
+                }
+            }
+            
+            if target_addresses.is_empty() {
+                eprintln!("No COPY_TRADING_TARGET_ADDRESS specified for risk check.");
+                return;
+            }
+            
+            let risk_service = solana_vntr_sniper::services::risk_management::RiskManagementService::new(
+                Arc::new(config.app_state.clone()),
+                target_addresses
+            );
+            
+            match risk_service.manual_risk_check().await {
+                Ok(_) => {
+                    println!("Risk check completed successfully!");
+                    return;
+                },
+                Err(e) => {
+                    eprintln!("Risk check failed: {}", e);
+                    return;
+                }
+            }
         }
     }
 
@@ -1038,6 +1096,22 @@ async fn main() {
         max_dev_buy: 0.1, // Default value since this field is not in Config
         transaction_landing_mode: config.transaction_landing_mode.clone(),
     };
+    
+    // Create and start the risk management service
+    let risk_management_service = RiskManagementService::new(
+        Arc::new(config.app_state.clone()),
+        target_addresses.clone()
+    );
+    
+    // Start risk management service in background
+    let risk_service_clone = risk_management_service.clone();
+    tokio::spawn(async move {
+        if let Err(e) = risk_service_clone.start_monitoring().await {
+            eprintln!("Risk management error: {}", e);
+        }
+    });
+    
+    println!("Risk management service started (checking every 10 minutes)");
     
     // Start the copy trading bot
     if let Err(e) = start_copy_trading(copy_trading_config).await {
