@@ -727,63 +727,8 @@ async fn execute_swap_transaction(
     let transaction_bytes = base64::decode(swap_transaction_base64)
         .map_err(|e| format!("Failed to decode transaction: {}", e))?;
     
-    // Try to deserialize as legacy transaction first (more compatible)
-    if let Ok(mut transaction) = bincode::deserialize::<Transaction>(&transaction_bytes) {
-        logger.log("Processing as legacy transaction".to_string());
-        
-        // Get recent blockhash
-        let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-            .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
-        
-        // Update the transaction's blockhash
-        transaction.message.recent_blockhash = recent_blockhash;
-        
-        // Sign the transaction
-        transaction.sign(&[&config.app_state.wallet], recent_blockhash);
-        
-        // Send the transaction with retry logic
-        let mut attempts = 0;
-        let max_attempts = 3;
-        
-        while attempts < max_attempts {
-            attempts += 1;
-            
-            // Send the transaction
-            match config.app_state.rpc_client.send_transaction(&transaction) {
-                Ok(signature) => {
-                    logger.log(format!("Swap transaction sent: {}", signature));
-                    
-                    // Wait for confirmation
-                    for _ in 0..30 { // Wait up to 30 seconds for confirmation
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        
-                        if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
-                            if let Some(result) = status {
-                                if result.is_ok() {
-                                    logger.log(format!("Swap transaction confirmed: {}", signature));
-                                    return Ok(signature.to_string());
-                                } else {
-                                    return Err(format!("Transaction failed: {:?}", result));
-                                }
-                            }
-                        }
-                    }
-                    
-                    return Err("Transaction confirmation timeout".to_string());
-                },
-                Err(e) => {
-                    logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
-                    
-                    if attempts >= max_attempts {
-                        return Err(format!("All swap attempts failed. Last error: {}", e));
-                    }
-                    
-                    // Wait before retry
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                }
-            }
-        }
-    } else if let Ok(mut transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+    // Try to deserialize as versioned transaction first (Jupiter v6 primarily uses versioned transactions)
+    if let Ok(mut transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
         logger.log("Processing as versioned transaction".to_string());
         
         // Get recent blockhash
@@ -844,6 +789,61 @@ async fn execute_swap_transaction(
                     
                     if attempts >= max_attempts {
                         return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                    }
+                    
+                    // Wait before retry
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    } else if let Ok(mut transaction) = bincode::deserialize::<Transaction>(&transaction_bytes) {
+        logger.log("Processing as legacy transaction".to_string());
+        
+        // Get recent blockhash
+        let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
+            .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+        
+        // Update the transaction's blockhash
+        transaction.message.recent_blockhash = recent_blockhash;
+        
+        // Sign the transaction
+        transaction.sign(&[&config.app_state.wallet], recent_blockhash);
+        
+        // Send the transaction with retry logic
+        let mut attempts = 0;
+        let max_attempts = 3;
+        
+        while attempts < max_attempts {
+            attempts += 1;
+            
+            // Send the transaction
+            match config.app_state.rpc_client.send_transaction(&transaction) {
+                Ok(signature) => {
+                    logger.log(format!("Swap transaction sent: {}", signature));
+                    
+                    // Wait for confirmation
+                    for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        
+                        if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
+                            if let Some(result) = status {
+                                if result.is_ok() {
+                                    logger.log(format!("Swap transaction confirmed: {}", signature));
+                                    return Ok(signature.to_string());
+                                } else {
+                                    return Err(format!("Transaction failed: {:?}", result));
+                                }
+                            }
+                        }
+                    }
+                    
+                    return Err("Transaction confirmation timeout".to_string());
+                },
+                Err(e) => {
+                    logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                    
+                    if attempts >= max_attempts {
+                        return Err(format!("All swap attempts failed. Last error: {}", e));
                     }
                     
                     // Wait before retry
