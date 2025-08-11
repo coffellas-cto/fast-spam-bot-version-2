@@ -236,6 +236,8 @@ impl Pump {
         // Create instructions as needed
         let mut create_instruction = None;
         let mut close_instruction = None;
+        let mut additional_instructions = Vec::new(); // For multiple account creation instructions
+        
         // Handle token accounts based on direction (buy or sell)
         let in_ata = get_associated_token_address(&owner, &token_in);
         let out_ata = get_associated_token_address(&owner, &token_out);
@@ -256,28 +258,13 @@ impl Pump {
             // Check if WSOL account exists for buying
             let wsol_ata = get_associated_token_address(&owner, &token_in); // token_in is SOL for buy
             if !self.check_token_account_cache(wsol_ata).await {
-                if create_instruction.is_some() {
-                    // If we already have a create instruction, we need to add both
-                    let mut instructions_vec = vec![create_instruction.unwrap()];
-                    instructions_vec.push(create_associated_token_account_idempotent(
-                        &owner,
-                        &owner,
-                        &token_in,
-                        &token_program_id,
-                    ));
-                    create_instruction = None; // Will be added differently below
-                    // Add both instructions to the main instruction list
-                    for instruction in instructions_vec {
-                        instructions.push(instruction);
-                    }
-                } else {
-                    create_instruction = Some(create_associated_token_account_idempotent(
-                        &owner,
-                        &owner,
-                        &token_in,
-                        &token_program_id,
-                    ));
-                }
+                let wsol_create_instruction = create_associated_token_account_idempotent(
+                    &owner,
+                    &owner,
+                    &token_in,
+                    &token_program_id,
+                );
+                additional_instructions.push(wsol_create_instruction);
                 // Cache the new WSOL account
                 self.cache_token_account(wsol_ata).await;
             }
@@ -368,6 +355,9 @@ impl Pump {
         let mut instructions = vec![];
         if let Some(create_instruction) = create_instruction {
             instructions.push(create_instruction);
+        }
+        for instruction in additional_instructions {
+            instructions.push(instruction);
         }
         if token_amount > 0 {
             instructions.push(swap_instruction);

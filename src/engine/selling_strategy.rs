@@ -607,7 +607,7 @@ impl SimpleSellingEngine {
             
             // First check if the account exists at all
             match self.app_state.rpc_nonblocking_client.get_account(ata).await {
-                Ok(Some(account_info)) => {
+                Ok(account_info) => {
                     self.logger.log(format!("Account {} exists, owner: {}, data length: {}", 
                         ata, account_info.owner, account_info.data.len()).cyan().to_string());
                     
@@ -660,20 +660,6 @@ impl SimpleSellingEngine {
                                 return Err(anyhow!(error_msg));
                             }
                         }
-                    }
-                },
-                Ok(None) => {
-                    if attempts < MAX_ATTEMPTS {
-                        self.logger.log(format!("Account {} not found for {} (attempt {}/{}), retrying in 2s...", 
-                            ata, mint, attempts, MAX_ATTEMPTS).yellow().to_string());
-                        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                        continue;
-                    } else {
-                        let error_msg = format!("Account {} not found for {} after {} attempts", ata, mint, MAX_ATTEMPTS);
-                        self.logger.log(error_msg.clone().red().to_string());
-                        // Remove the token from tracking since verification failed
-                        BOUGHT_TOKENS.remove_token(mint);
-                        return Err(anyhow!(error_msg));
                     }
                 },
                 Err(e) => {
