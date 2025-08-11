@@ -57,9 +57,8 @@ use solana_vntr_sniper::{
 };
 use solana_program_pack::Pack;
 use anchor_client::solana_sdk::pubkey::Pubkey;
-use anchor_client::solana_sdk::transaction::{Transaction, VersionedTransaction};
+use anchor_client::solana_sdk::transaction::Transaction;
 use anchor_client::solana_sdk::system_instruction;
-use anchor_client::solana_sdk::message::{Message, VersionedMessage};
 use std::str::FromStr;
 use colored::Colorize;
 use spl_token::instruction::sync_native;
@@ -675,25 +674,17 @@ async fn execute_swap_transaction(
     let transaction_bytes = base64::decode(swap_transaction_base64)
         .map_err(|e| format!("Failed to decode transaction: {}", e))?;
     
-    // Try to deserialize as versioned transaction first
-    if let Ok(mut versioned_transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+    // Try to deserialize as legacy transaction first (more compatible)
+    if let Ok(mut transaction) = bincode::deserialize::<Transaction>(&transaction_bytes) {
         // Get recent blockhash
         let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
             .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
         
-        // Update blockhash in the message
-        match &mut versioned_transaction.message {
-            VersionedMessage::Legacy(ref mut message) => {
-                message.recent_blockhash = recent_blockhash;
-            },
-            VersionedMessage::V0(ref mut message) => {
-                message.recent_blockhash = recent_blockhash;
-            }
-        }
+        // Update the transaction's blockhash
+        transaction.message.recent_blockhash = recent_blockhash;
         
         // Sign the transaction
-        let signers = vec![&config.app_state.wallet];
-        versioned_transaction.sign(&signers, recent_blockhash);
+        transaction.sign(&[&config.app_state.wallet], recent_blockhash);
         
         // Send the transaction with retry logic
         let mut attempts = 0;
@@ -702,8 +693,8 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Send the versioned transaction
-            match config.app_state.rpc_client.send_transaction(&versioned_transaction) {
+            // Send the transaction
+            match config.app_state.rpc_client.send_transaction(&transaction) {
                 Ok(signature) => {
                     logger.log(format!("Swap transaction sent: {}", signature));
                     
@@ -738,7 +729,10 @@ async fn execute_swap_transaction(
             }
         }
     } else {
-        return Err("Failed to deserialize transaction as VersionedTransaction".to_string());
+        // If Jupiter returns versioned transactions, we need to handle them differently
+        // For now, return an error since the existing codebase uses legacy transactions
+        logger.log("Transaction format not supported - expected legacy transaction".yellow().to_string());
+        return Err("Unsupported transaction format - only legacy transactions are supported".to_string());
     }
     
     Err("Maximum retry attempts exceeded".to_string())
