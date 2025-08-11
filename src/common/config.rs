@@ -65,9 +65,9 @@ impl Config {
 
             let yellowstone_grpc_http = import_env_var("YELLOWSTONE_GRPC_HTTP");
             let yellowstone_grpc_token = import_env_var("YELLOWSTONE_GRPC_TOKEN");
-            let slippage_input = import_env_var("SLIPPAGE").parse::<u64>().unwrap_or(5000);
-            let counter_limit = import_env_var("COUNTER_LIMIT").parse::<u32>().unwrap_or(10_u32);
-            let transaction_landing_mode = import_env_var("TRANSACTION_LANDING_SERVICE")
+            let slippage_input = import_env_var_with_default("SLIPPAGE", "5000").parse::<u64>().unwrap_or(5000);
+            let counter_limit = import_env_var_with_default("COUNTER_LIMIT", "10").parse::<u32>().unwrap_or(10_u32);
+            let transaction_landing_mode = import_env_var_with_default("TRANSACTION_LANDING_SERVICE", "zeroslot")
                 .parse::<TransactionLandingMode>()
                 .unwrap_or(TransactionLandingMode::default());
             let max_slippage: u64 = 10000 ;
@@ -94,7 +94,7 @@ impl Config {
             let wallet_cloned = wallet.clone();
             let swap_direction = SwapDirection::Buy; //SwapDirection::Sell
             let in_type = SwapInType::Qty; //SwapInType::Pct
-            let amount_in = import_env_var("TOKEN_AMOUNT")
+            let amount_in = import_env_var_with_default("TOKEN_AMOUNT", "0.001")
                 .parse::<f64>()
                 .unwrap_or(0.001_f64); //quantity
                                         // let in_type = "pct"; //percentage
@@ -118,13 +118,14 @@ impl Config {
                     format!(
                     "[SNIPER ENVIRONMENT]: \n\t\t\t\t [Yellowstone gRpc]: {},
                     \n\t\t\t\t * [Wallet]: {:?}, * [Balance]: {} Sol, 
-                    \n\t\t\t\t * [Slippage]: {}, * [Solana]: {}, * [Amount]: {}",
+                    \n\t\t\t\t * [Slippage]: {}, * [Solana]: {}, * [Amount]: {}, * [Counter Limit]: {}",
                     yellowstone_grpc_http,
                     wallet_cloned.pubkey(),
                     balance as f64 / 1_000_000_000_f64,
                     slippage_input,
                     solana_price,
                     amount_in,
+                    counter_limit,
                 )
                 .purple()
                 .italic()
@@ -234,8 +235,25 @@ pub fn import_env_var(key: &str) -> String {
     match env::var(key){
         Ok(res) => res,
         Err(e) => {
-            println!("{}", format!("{}: {}", e, key).red().to_string());
-            loop{}
+            println!("{}", format!("Environment variable not found: {} - {}", key, e).red().to_string());
+            String::new() // Return empty string instead of infinite loop
+        }
+    }
+}
+
+// New function for environment variables with defaults
+pub fn import_env_var_with_default(key: &str, default: &str) -> String {
+    match env::var(key){
+        Ok(res) => {
+            if res.trim().is_empty() {
+                default.to_string()
+            } else {
+                res
+            }
+        },
+        Err(_) => {
+            println!("{}", format!("Environment variable {} not found, using default: {}", key, default).yellow().to_string());
+            default.to_string()
         }
     }
 }
@@ -249,7 +267,7 @@ pub fn get_zero_slot_health_url() -> String {
 }
 
 pub fn create_rpc_client() -> Result<Arc<anchor_client::solana_client::rpc_client::RpcClient>> {
-    let rpc_http = import_env_var("RPC_HTTP");
+    let rpc_http = import_env_var_with_default("RPC_HTTP", "https://api.mainnet-beta.solana.com");
     let timeout = Duration::from_secs(30); // 30 second timeout
     let rpc_client = anchor_client::solana_client::rpc_client::RpcClient::new_with_timeout_and_commitment(
         rpc_http,
@@ -261,7 +279,7 @@ pub fn create_rpc_client() -> Result<Arc<anchor_client::solana_client::rpc_clien
 
 pub async fn create_nonblocking_rpc_client(
 ) -> Result<Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>> {
-    let rpc_http = import_env_var("RPC_HTTP");
+    let rpc_http = import_env_var_with_default("RPC_HTTP", "https://api.mainnet-beta.solana.com");
     let timeout = Duration::from_secs(30); // 30 second timeout
     let rpc_client = anchor_client::solana_client::nonblocking::rpc_client::RpcClient::new_with_timeout_and_commitment(
         rpc_http,
@@ -291,10 +309,12 @@ pub async fn create_coingecko_proxy() -> Result<f64, Error> {
 }
 
 pub fn import_wallet() -> Result<Arc<Keypair>> {
-    let priv_key = import_env_var("PRIVATE_KEY");
+    let priv_key = import_env_var("WALLET_PRIVATE_KEY");
+    if priv_key.is_empty() {
+        panic!("{}", "WALLET_PRIVATE_KEY environment variable is required!".red().to_string());
+    }
     if priv_key.len() < 85 {
-        println!("{}", format!("Please check wallet priv key: Invalid length => {}", priv_key.len()).red().to_string());
-        loop{}
+        panic!("{}", format!("Please check wallet private key: Invalid length => {}", priv_key.len()).red().to_string());
     }
     let wallet: Keypair = Keypair::from_base58_string(priv_key.as_str());
 
