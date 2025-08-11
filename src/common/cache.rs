@@ -214,6 +214,90 @@ pub struct BoughtTokenInfo {
     pub buy_time: Instant,
     pub buy_signature: String,
     pub protocol: String,
+    // New fields for balance caching
+    pub cached_balance_raw: u64,
+    pub cached_balance_decimal: f64,
+    pub cached_decimals: u8,
+    pub balance_cache_time: Instant,
+    pub balance_verified: bool,
+}
+
+/// Token balance cache entry
+#[derive(Clone, Debug)]
+pub struct TokenBalanceInfo {
+    pub balance_raw: u64,
+    pub balance_decimal: f64,
+    pub decimals: u8,
+    pub cached_at: Instant,
+    pub verified: bool,
+}
+
+impl TokenBalanceInfo {
+    pub fn new(balance_raw: u64, balance_decimal: f64, decimals: u8, verified: bool) -> Self {
+        Self {
+            balance_raw,
+            balance_decimal,
+            decimals,
+            cached_at: Instant::now(),
+            verified,
+        }
+    }
+
+    pub fn is_stale(&self, max_age_seconds: u64) -> bool {
+        Instant::now().duration_since(self.cached_at).as_secs() > max_age_seconds
+    }
+}
+
+/// Dedicated token balance cache for fast selling
+pub struct TokenBalanceCache {
+    balances: RwLock<HashMap<String, TokenBalanceInfo>>, // mint -> balance info
+    default_ttl: u64,
+}
+
+impl TokenBalanceCache {
+    pub fn new(default_ttl: u64) -> Self {
+        Self {
+            balances: RwLock::new(HashMap::new()),
+            default_ttl,
+        }
+    }
+
+    pub fn get_balance(&self, mint: &str) -> Option<TokenBalanceInfo> {
+        let balances = self.balances.read().unwrap();
+        if let Some(balance_info) = balances.get(mint) {
+            if !balance_info.is_stale(self.default_ttl) {
+                return Some(balance_info.clone());
+            }
+        }
+        None
+    }
+
+    pub fn cache_balance(&self, mint: String, balance_raw: u64, balance_decimal: f64, decimals: u8, verified: bool) {
+        let mut balances = self.balances.write().unwrap();
+        balances.insert(mint, TokenBalanceInfo::new(balance_raw, balance_decimal, decimals, verified));
+    }
+
+    pub fn update_balance_verification(&self, mint: &str, verified: bool) {
+        let mut balances = self.balances.write().unwrap();
+        if let Some(balance_info) = balances.get_mut(mint) {
+            balance_info.verified = verified;
+        }
+    }
+
+    pub fn remove_balance(&self, mint: &str) {
+        let mut balances = self.balances.write().unwrap();
+        balances.remove(mint);
+    }
+
+    pub fn clear_stale(&self) {
+        let mut balances = self.balances.write().unwrap();
+        balances.retain(|_, balance_info| !balance_info.is_stale(self.default_ttl));
+    }
+
+    pub fn size(&self) -> usize {
+        let balances = self.balances.read().unwrap();
+        balances.len()
+    }
 }
 
 /// Bought tokens tracker
@@ -237,6 +321,12 @@ impl BoughtTokensTracker {
             buy_time: Instant::now(),
             buy_signature,
             protocol,
+            // New fields for balance caching
+            cached_balance_raw: 0,
+            cached_balance_decimal: 0.0,
+            cached_decimals: 0,
+            balance_cache_time: Instant::now(),
+            balance_verified: false,
         });
     }
     
@@ -276,6 +366,42 @@ impl BoughtTokensTracker {
             token_info.amount = new_amount;
         }
     }
+
+    /// Cache verified balance after successful buy transaction
+    pub fn cache_verified_balance(&self, mint: &str, balance_raw: u64, balance_decimal: f64, decimals: u8) {
+        let mut tokens = self.tokens.write().unwrap();
+        if let Some(token_info) = tokens.get_mut(mint) {
+            token_info.cached_balance_raw = balance_raw;
+            token_info.cached_balance_decimal = balance_decimal;
+            token_info.cached_decimals = decimals;
+            token_info.balance_cache_time = Instant::now();
+            token_info.balance_verified = true;
+        }
+    }
+
+    /// Get cached balance if available and not too old
+    pub fn get_cached_balance(&self, mint: &str, max_age_seconds: u64) -> Option<(u64, f64, u8)> {
+        let tokens = self.tokens.read().unwrap();
+        if let Some(token_info) = tokens.get(mint) {
+            if token_info.balance_verified && 
+               Instant::now().duration_since(token_info.balance_cache_time).as_secs() <= max_age_seconds {
+                return Some((
+                    token_info.cached_balance_raw,
+                    token_info.cached_balance_decimal,
+                    token_info.cached_decimals
+                ));
+            }
+        }
+        None
+    }
+
+    /// Mark balance as potentially stale (e.g., after failed transaction)
+    pub fn invalidate_balance_cache(&self, mint: &str) {
+        let mut tokens = self.tokens.write().unwrap();
+        if let Some(token_info) = tokens.get_mut(mint) {
+            token_info.balance_verified = false;
+        }
+    }
 }
 
 // Global cache instances with reasonable TTL values
@@ -285,4 +411,5 @@ lazy_static! {
     pub static ref WALLET_TOKEN_ACCOUNTS: WalletTokenAccounts = WalletTokenAccounts::new();
     pub static ref TARGET_WALLET_TOKENS: TargetWalletTokens = TargetWalletTokens::new();
     pub static ref BOUGHT_TOKENS: BoughtTokensTracker = BoughtTokensTracker::new();
+    pub static ref TOKEN_BALANCE_CACHE: TokenBalanceCache = TokenBalanceCache::new(300); // 5 minutes TTL
 } 
