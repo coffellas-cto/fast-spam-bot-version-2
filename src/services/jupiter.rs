@@ -10,7 +10,6 @@ use anchor_client::solana_sdk::{
     transaction::VersionedTransaction,
 };
 use anchor_client::solana_client::nonblocking::rpc_client::RpcClient;
-use base64::{Engine, prelude::BASE64_STANDARD};
 use tokio::time::Duration;
 
 use crate::common::logger::Logger;
