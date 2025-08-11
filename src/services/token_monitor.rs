@@ -66,9 +66,17 @@ impl TokenMonitor {
         // Get current token balance
         let current_balance = match self.app_state.rpc_nonblocking_client.get_token_account(&token_info.token_account).await {
             Ok(Some(account)) => {
+                let amount_raw = account.token_amount.amount.parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse token amount: {}", e))?;
                 let amount_value = account.token_amount.amount.parse::<f64>()
                     .map_err(|e| anyhow::anyhow!("Failed to parse token amount: {}", e))?;
                 let decimal_amount = amount_value / 10f64.powi(account.token_amount.decimals as i32);
+                let decimals = account.token_amount.decimals;
+                
+                // Update both the tracked balance AND the cached balance for selling
+                BOUGHT_TOKENS.update_token_balance(&token_info.mint, decimal_amount);
+                BOUGHT_TOKENS.cache_verified_balance(&token_info.mint, amount_raw, decimal_amount, decimals);
+                
                 decimal_amount
             },
             Ok(None) => {
@@ -81,9 +89,6 @@ impl TokenMonitor {
                 return Err(anyhow::anyhow!("Failed to get token account: {}", e));
             }
         };
-        
-        // Update the tracked balance
-        BOUGHT_TOKENS.update_token_balance(&token_info.mint, current_balance);
         
         // Log if balance changed significantly
         if (current_balance - token_info.amount).abs() > 0.01 {
