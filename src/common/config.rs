@@ -309,9 +309,9 @@ pub async fn create_coingecko_proxy() -> Result<f64, Error> {
 }
 
 pub fn import_wallet() -> Result<Arc<Keypair>> {
-    let priv_key = import_env_var("WALLET_PRIVATE_KEY");
+    let priv_key = import_env_var("PRIVATE_KEY");
     if priv_key.is_empty() {
-        panic!("{}", "WALLET_PRIVATE_KEY environment variable is required!".red().to_string());
+        panic!("{}", "PRIVATE_KEY environment variable is required!".red().to_string());
     }
     if priv_key.len() < 85 {
         panic!("{}", format!("Please check wallet private key: Invalid length => {}", priv_key.len()).red().to_string());
