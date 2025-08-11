@@ -5,7 +5,7 @@ use colored::Colorize;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use anchor_client::solana_sdk::{
-    signature::Keypair,
+    signature::{Keypair, Signer}, // Add Signer trait import
     pubkey::Pubkey,
     transaction::VersionedTransaction,
 };
@@ -29,7 +29,7 @@ struct QuoteRequest {
     slippage_bps: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)] // Add Serialize derive
 struct QuoteResponse {
     #[serde(rename = "inputMint")]
     pub input_mint: String,
@@ -217,7 +217,7 @@ impl JupiterClient {
         transaction.message.set_recent_blockhash(recent_blockhash);
 
         // Sign the transaction
-        transaction.sign(&[keypair], recent_blockhash)?;
+        transaction.try_partial_sign(&[keypair], recent_blockhash)?;
 
         // Send the transaction
         let signature = self.rpc_client.send_transaction(&transaction).await?;
