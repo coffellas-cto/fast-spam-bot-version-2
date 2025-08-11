@@ -477,69 +477,134 @@ impl RiskManagementService {
         let transaction_bytes = base64::decode(swap_transaction_base64)
             .map_err(|e| anyhow::anyhow!("Failed to decode transaction: {}", e))?;
         
-        // Try to deserialize as versioned transaction first
-        if let Ok(versioned_transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+        // Try to deserialize as legacy transaction first
+        if let Ok(mut transaction) = bincode::deserialize::<Transaction>(&transaction_bytes) {
             // Get recent blockhash
             let recent_blockhash = self.app_state.rpc_client.get_latest_blockhash()
                 .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
             
-            // Convert to legacy transaction if possible for compatibility
-            match versioned_transaction.message {
-                VersionedMessage::Legacy(legacy_message) => {
-                    // Create a new transaction with updated blockhash
-                    let mut new_message = legacy_message.clone();
-                    new_message.recent_blockhash = recent_blockhash;
-                    
-                    let transaction = Transaction {
-                        signatures: vec![anchor_client::solana_sdk::signature::Signature::default(); new_message.header.num_required_signatures as usize],
-                        message: new_message,
-                    };
-                    
-                    // Sign the transaction
-                    let signed_transaction = Transaction::new_signed_with_payer(
-                        &transaction.message.instructions,
-                        Some(&self.app_state.wallet.pubkey()),
-                        &vec![&self.app_state.wallet],
-                        recent_blockhash,
-                    );
-                    
-                    // Send using RPC client directly
-                    match self.app_state.rpc_client.send_transaction(&signed_transaction) {
-                        Ok(signature) => {
-                            self.logger.log(format!("Swap transaction sent: {}", signature));
+            // Update the transaction's blockhash
+            transaction.message.recent_blockhash = recent_blockhash;
+            
+            // Sign the transaction
+            transaction.sign(&[&self.app_state.wallet], recent_blockhash);
+            
+            // Send using RPC client directly with retry logic
+            let mut attempts = 0;
+            let max_attempts = 3;
+            
+            while attempts < max_attempts {
+                attempts += 1;
+                
+                match self.app_state.rpc_client.send_transaction(&transaction) {
+                    Ok(signature) => {
+                        self.logger.log(format!("Swap transaction sent: {}", signature));
+                        
+                        // Wait for confirmation
+                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                            time::sleep(Duration::from_secs(1)).await;
                             
-                            // Wait for confirmation
-                            for _ in 0..30 { // Wait up to 30 seconds for confirmation
-                                time::sleep(Duration::from_secs(1)).await;
-                                
-                                if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
-                                    if let Some(result) = status {
-                                        if result.is_ok() {
-                                            self.logger.log(format!("Swap transaction confirmed: {}", signature));
-                                            return Ok(signature.to_string());
-                                        } else {
-                                            return Err(anyhow::anyhow!("Transaction failed: {:?}", result));
-                                        }
+                            if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
+                                if let Some(result) = status {
+                                    if result.is_ok() {
+                                        self.logger.log(format!("Swap transaction confirmed: {}", signature));
+                                        return Ok(signature.to_string());
+                                    } else {
+                                        return Err(anyhow::anyhow!("Transaction failed: {:?}", result));
                                     }
                                 }
                             }
-                            
-                            return Err(anyhow::anyhow!("Transaction confirmation timeout"));
-                        },
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("Failed to send transaction: {}", e));
                         }
+                        
+                        return Err(anyhow::anyhow!("Transaction confirmation timeout"));
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                        
+                        if attempts >= max_attempts {
+                            return Err(anyhow::anyhow!("All swap attempts failed. Last error: {}", e));
+                        }
+                        
+                        // Wait before retry
+                        time::sleep(Duration::from_secs(2)).await;
                     }
+                }
+            }
+        } else if let Ok(versioned_transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+            // Handle versioned transactions (Jupiter v6 API returns these)
+            self.logger.log("Handling versioned transaction from Jupiter".to_string());
+            
+            // Get recent blockhash
+            let recent_blockhash = self.app_state.rpc_client.get_latest_blockhash()
+                .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
+            
+            // For versioned transactions, we need to use a different approach
+            // We'll try to send it directly since Jupiter already prepared it
+            let mut signed_transaction = versioned_transaction;
+            
+            // Update blockhash if it's a legacy message within versioned transaction
+            match &mut signed_transaction.message {
+                VersionedMessage::Legacy(ref mut message) => {
+                    message.recent_blockhash = recent_blockhash;
                 },
-                VersionedMessage::V0(_) => {
-                    // For V0 transactions, we'll need to handle them differently
-                    // For now, return an error as most of the codebase uses legacy transactions
-                    return Err(anyhow::anyhow!("V0 transactions not supported in risk management yet"));
+                VersionedMessage::V0(ref mut message) => {
+                    message.recent_blockhash = recent_blockhash;
+                }
+            }
+            
+            // Sign the versioned transaction
+            signed_transaction.sign(&[&self.app_state.wallet], recent_blockhash);
+            
+            // Send with retry logic
+            let mut attempts = 0;
+            let max_attempts = 3;
+            
+            while attempts < max_attempts {
+                attempts += 1;
+                
+                // Convert to raw transaction bytes for sending
+                let serialized = bincode::serialize(&signed_transaction)
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
+                
+                match self.app_state.rpc_client.send_raw_transaction(&serialized) {
+                    Ok(signature) => {
+                        self.logger.log(format!("Versioned swap transaction sent: {}", signature));
+                        
+                        // Wait for confirmation
+                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                            time::sleep(Duration::from_secs(1)).await;
+                            
+                            if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
+                                if let Some(result) = status {
+                                    if result.is_ok() {
+                                        self.logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                        return Ok(signature.to_string());
+                                    } else {
+                                        return Err(anyhow::anyhow!("Transaction failed: {:?}", result));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return Err(anyhow::anyhow!("Transaction confirmation timeout"));
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                        
+                        if attempts >= max_attempts {
+                            return Err(anyhow::anyhow!("All versioned swap attempts failed. Last error: {}", e));
+                        }
+                        
+                        // Wait before retry
+                        time::sleep(Duration::from_secs(2)).await;
+                    }
                 }
             }
         } else {
-            return Err(anyhow::anyhow!("Failed to deserialize transaction"));
+            return Err(anyhow::anyhow!("Failed to deserialize transaction as either Transaction or VersionedTransaction"));
         }
+        
+        Err(anyhow::anyhow!("Maximum retry attempts exceeded"))
     }
     
     /// Clear all caches and reset state
