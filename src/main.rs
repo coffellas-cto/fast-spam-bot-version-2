@@ -604,8 +604,9 @@ async fn get_jupiter_quote(
         .map_err(|e| format!("Failed to get quote: {}", e))?;
     
     if !response.status().is_success() {
+        let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("Quote API returned status: {} - {}", response.status(), error_text));
+        return Err(format!("Quote API returned status: {} - {}", status, error_text));
     }
     
     let quote: JupiterQuoteResponse = response.json()
@@ -624,7 +625,7 @@ async fn get_jupiter_swap_transaction(
     user_public_key: &str,
 ) -> Result<String, String> {
     let logger = solana_vntr_sniper::common::logger::Logger::new("[JUPITER-SWAP] => ".blue().to_string());
-    logger.log("Getting swap transaction from Jupiter");
+    logger.log("Getting swap transaction from Jupiter".to_string());
     
     let client = reqwest::Client::new();
     let url = format!("{}/v6/swap", JUPITER_API_URL);
@@ -649,15 +650,16 @@ async fn get_jupiter_swap_transaction(
         .map_err(|e| format!("Failed to get swap transaction: {}", e))?;
     
     if !response.status().is_success() {
+        let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("Swap API returned status: {} - {}", response.status(), error_text));
+        return Err(format!("Swap API returned status: {} - {}", status, error_text));
     }
     
     let swap_response: JupiterSwapResponse = response.json()
         .await
         .map_err(|e| format!("Failed to parse swap response: {}", e))?;
     
-    logger.log("Swap transaction received from Jupiter");
+    logger.log("Swap transaction received from Jupiter".to_string());
     Ok(swap_response.swap_transaction)
 }
 
@@ -667,7 +669,7 @@ async fn execute_swap_transaction(
     swap_transaction_base64: &str,
 ) -> Result<String, String> {
     let logger = solana_vntr_sniper::common::logger::Logger::new("[EXECUTE-SWAP] => ".green().to_string());
-    logger.log("Executing swap transaction");
+    logger.log("Executing swap transaction".to_string());
     
     // Decode the base64 transaction
     let transaction_bytes = base64::decode(swap_transaction_base64)
@@ -691,8 +693,7 @@ async fn execute_swap_transaction(
         
         // Sign the transaction
         let signers = vec![&config.app_state.wallet];
-        versioned_transaction.try_sign(&signers, recent_blockhash)
-            .map_err(|e| format!("Failed to sign transaction: {}", e))?;
+        versioned_transaction.sign(&signers, recent_blockhash);
         
         // Send the transaction with retry logic
         let mut attempts = 0;
@@ -701,11 +702,8 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Use send_raw_transaction for better control
-            let serialized_transaction = bincode::serialize(&versioned_transaction)
-                .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-            
-            match config.app_state.rpc_client.send_raw_transaction(&serialized_transaction) {
+            // Send the versioned transaction
+            match config.app_state.rpc_client.send_transaction(&versioned_transaction) {
                 Ok(signature) => {
                     logger.log(format!("Swap transaction sent: {}", signature));
                     
@@ -1089,7 +1087,7 @@ async fn main() {
         app_state: config.app_state.clone(),
         swap_config: config.swap_config.clone(),
         counter_limit: config.counter_limit as u64,
-        target_addresses,
+        target_addresses: target_addresses.clone(),
         excluded_addresses,
         protocol_preference,
         min_dev_buy: 0.001, // Default value since this field is not in Config
