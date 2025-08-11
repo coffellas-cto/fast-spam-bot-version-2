@@ -581,35 +581,126 @@ impl SimpleSellingEngine {
     async fn verify_and_cache_balance(&self, mint: &str, ata: &Pubkey) -> Result<()> {
         self.logger.log(format!("Verifying and caching balance for token: {}", mint).blue().to_string());
         
-        // Wait a bit for transaction to settle
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Use progressive retry with longer initial wait for transaction settlement
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 5;
+        const INITIAL_WAIT: u64 = 1000; // Start with 1 second
         
-        // Get token account to cache balance
-        match self.app_state.rpc_nonblocking_client.get_token_account(ata).await {
-            Ok(Some(account)) => {
-                let amount_raw = account.token_amount.amount.parse::<u64>()
-                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
-                let decimal_amount = account.token_amount.amount.parse::<f64>()
-                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?
-                    / 10f64.powi(account.token_amount.decimals as i32);
-                let decimals = account.token_amount.decimals;
+        while retry_count < MAX_RETRIES {
+            // Progressive wait times: 1s, 2s, 3s, 5s, 8s
+            let wait_ms = match retry_count {
+                0 => INITIAL_WAIT,
+                1 => 2000,
+                2 => 3000,
+                3 => 5000,
+                _ => 8000,
+            };
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+            
+            match self.app_state.rpc_nonblocking_client.get_token_account(ata).await {
+                Ok(Some(account)) => {
+                    // Validate that we got a proper token account response
+                    if account.token_amount.amount.is_empty() {
+                        self.logger.log(format!("Empty token amount on attempt {}, retrying...", retry_count + 1).yellow().to_string());
+                        retry_count += 1;
+                        continue;
+                    }
+                    
+                    match account.token_amount.amount.parse::<u64>() {
+                        Ok(amount_raw) => {
+                            // Ensure we have a non-zero balance before proceeding
+                            if amount_raw == 0 && retry_count < MAX_RETRIES - 1 {
+                                self.logger.log(format!("Zero balance on attempt {}, retrying...", retry_count + 1).yellow().to_string());
+                                retry_count += 1;
+                                continue;
+                            }
+                            
+                            let decimal_amount = amount_raw as f64 / 10f64.powi(account.token_amount.decimals as i32);
+                            let decimals = account.token_amount.decimals;
+                            
+                            // Cache the verified balance
+                            BOUGHT_TOKENS.cache_verified_balance(mint, amount_raw, decimal_amount, decimals);
+                            self.logger.log(format!("Cached verified balance for {}: {} tokens ({} raw units)", 
+                                mint, decimal_amount, amount_raw).green().to_string());
+                            
+                            return Ok(());
+                        },
+                        Err(e) => {
+                            self.logger.log(format!("Failed to parse token amount on attempt {}: {}, retrying...", retry_count + 1, e).yellow().to_string());
+                        }
+                    }
+                },
+                Ok(None) => {
+                    if retry_count < MAX_RETRIES - 1 {
+                        self.logger.log(format!("Token account not found on attempt {}, retrying...", retry_count + 1).yellow().to_string());
+                    } else {
+                        self.logger.log(format!("Token account not found for {} after {} retries, balance cache skipped", mint, MAX_RETRIES).yellow().to_string());
+                        return Ok(()); // Don't fail the buy process
+                    }
+                },
+                Err(e) => {
+                    // Check if this is a parsing error specifically
+                    let error_msg = e.to_string();
+                    if error_msg.contains("could not be parsed as token account") {
+                        if retry_count < MAX_RETRIES - 1 {
+                            self.logger.log(format!("Token account parsing error on attempt {}: {}, retrying...", retry_count + 1, e).yellow().to_string());
+                        } else {
+                            self.logger.log(format!("Persistent token account parsing error for {}: {}", mint, e).red().to_string());
+                            // Try to wait longer and make one final attempt using a different approach
+                            return self.fallback_balance_verification(mint, ata).await;
+                        }
+                    } else {
+                        self.logger.log(format!("RPC error on attempt {}: {}, retrying...", retry_count + 1, e).yellow().to_string());
+                    }
+                }
+            }
+            
+            retry_count += 1;
+        }
+        
+        self.logger.log(format!("Failed to verify balance for {} after {} attempts", mint, MAX_RETRIES).red().to_string());
+        Ok(()) // Don't fail the whole buy process if balance verification fails
+    }
+
+    /// Fallback balance verification using account info instead of token account
+    async fn fallback_balance_verification(&self, mint: &str, ata: &Pubkey) -> Result<()> {
+        self.logger.log(format!("Attempting fallback balance verification for {}", mint).cyan().to_string());
+        
+        // Wait a bit longer for account to be fully created
+        tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+        
+        match self.app_state.rpc_nonblocking_client.get_account_info(ata).await {
+            Ok(Some(account_info)) => {
+                // Try to parse the account data manually
+                if account_info.data.len() >= 64 { // Minimum size for token account
+                    // For SPL token accounts, the amount is stored at offset 64-72 (8 bytes)
+                    if let Some(amount_bytes) = account_info.data.get(64..72) {
+                        let amount_raw = u64::from_le_bytes(
+                            amount_bytes.try_into().unwrap_or([0; 8])
+                        );
+                        
+                        if amount_raw > 0 {
+                            // Use default decimals (6) for fallback - this is common for most tokens
+                            let decimals = 6u8;
+                            let decimal_amount = amount_raw as f64 / 10f64.powi(decimals as i32);
+                            
+                            BOUGHT_TOKENS.cache_verified_balance(mint, amount_raw, decimal_amount, decimals);
+                            self.logger.log(format!("Fallback verification successful for {}: {} tokens ({} raw units, assumed {} decimals)", 
+                                mint, decimal_amount, amount_raw, decimals).green().to_string());
+                            return Ok(());
+                        }
+                    }
+                }
                 
-                // Cache the verified balance
-                BOUGHT_TOKENS.cache_verified_balance(mint, amount_raw, decimal_amount, decimals);
-                self.logger.log(format!("Cached verified balance for {}: {} tokens ({} raw units)", 
-                    mint, decimal_amount, amount_raw).green().to_string());
-                
-                Ok(())
+                self.logger.log(format!("Fallback verification failed - couldn't parse account data for {}", mint).yellow().to_string());
             },
-            Ok(None) => {
-                self.logger.log(format!("Token account not found for {}, balance cache skipped", mint).yellow().to_string());
-                Ok(())
-            },
-            Err(e) => {
-                self.logger.log(format!("Failed to verify balance for {}: {}", mint, e).yellow().to_string());
-                Ok(()) // Don't fail the whole buy process if balance verification fails
+            _ => {
+                self.logger.log(format!("Fallback verification failed - couldn't get account info for {}", mint).yellow().to_string());
             }
         }
+        
+        Ok(())
     }
 
     /// Get token balance with low latency - tries cache first, falls back to RPC
