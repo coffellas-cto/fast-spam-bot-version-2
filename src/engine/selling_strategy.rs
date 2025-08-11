@@ -291,34 +291,24 @@ impl SimpleSellingEngine {
                 return Ok(());
             }
         };
+
+        // Check if we have cached balance (required for selling without RPC calls)
+        let cached_balance = BOUGHT_TOKENS.get_cached_balance(&trade_info.mint, 30);
+        if cached_balance.is_none() {
+            self.logger.log(format!("No cached balance found for {}, skipping sell", trade_info.mint).yellow().to_string());
+            return Err(anyhow!("Cached balance required for selling but not found"));
+        }
+
+        let (token_amount_raw, token_amount, token_decimals) = cached_balance.unwrap();
         
-        // Get wallet pubkey
-        let wallet_pubkey = self.app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
-
-        // Get token account to determine actual balance
-        let token_pubkey = Pubkey::from_str(&trade_info.mint)
-            .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
-        let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
-
-        // Get current token balance info - try cache first for low latency
-        let (token_amount, token_amount_raw, token_decimals) = match self.get_token_balance_fast(&trade_info.mint, &ata).await {
-            Ok(balance_info) => {
-                self.logger.log(format!("Using cached balance for selling {} tokens ({} raw units)", 
-                    balance_info.1, balance_info.0).cyan().to_string());
-                balance_info
-            },
-            Err(e) => {
-                self.logger.log(format!("Failed to get token balance: {}", e).red().to_string());
-                return Err(e);
-            }
-        };
-
         if token_amount <= 0.0 {
             self.logger.log("No tokens to sell, removing from tracking".yellow().to_string());
             BOUGHT_TOKENS.remove_token(&trade_info.mint);
             return Ok(());
         }
+
+        self.logger.log(format!("Using cached balance for selling {} tokens ({} raw units)", 
+            token_amount, token_amount_raw).cyan().to_string());
 
         // Create sell config
         let mut sell_config = (*self.swap_config).clone();
@@ -333,25 +323,28 @@ impl SimpleSellingEngine {
                 self.logger.log(format!("Native sell successful: {}", signature).green().to_string());
                 // Remove token from tracking after successful sell
                 BOUGHT_TOKENS.remove_token(&trade_info.mint);
-                self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
                 Ok(())
             },
             Err(e) => {
-                self.logger.log(format!("All native sell attempts failed: {}. Trying Jupiter fallback...", e).red().to_string());
+                self.logger.log(format!("All native sell attempts failed: {}", e).red().to_string());
                 
-                // Fallback to Jupiter
-                match self.execute_jupiter_sell(&trade_info.mint, token_amount_raw, token_decimals).await {
-                    Ok(signature) => {
-                        self.logger.log(format!("Jupiter sell successful: {}", signature).green().to_string());
-                        // Remove token from tracking after successful sell
-                        BOUGHT_TOKENS.remove_token(&trade_info.mint);
-                        self.logger.log(format!("Removed token {} from tracking after Jupiter sell", trade_info.mint));
-                        Ok(())
-                    },
-                    Err(jupiter_error) => {
-                        self.logger.log(format!("Jupiter sell also failed: {}. Keeping token in tracking for future attempts.", jupiter_error).red().to_string());
-                        Err(anyhow!("Both native and Jupiter sells failed. Native: {}, Jupiter: {}", e, jupiter_error))
+                // Try Jupiter as fallback only if we have valid balance info
+                if token_amount_raw > 0 {
+                    self.logger.log("Trying Jupiter as fallback...".magenta().to_string());
+                    match self.execute_jupiter_sell(&trade_info.mint, token_amount_raw, token_decimals).await {
+                        Ok(signature) => {
+                            self.logger.log(format!("Jupiter sell fallback successful: {}", signature).green().to_string());
+                            // Remove token from tracking after successful sell
+                            BOUGHT_TOKENS.remove_token(&trade_info.mint);
+                            Ok(())
+                        },
+                        Err(jupiter_error) => {
+                            self.logger.log(format!("Jupiter sell fallback also failed: {}", jupiter_error).red().to_string());
+                            Err(anyhow!("Both native and Jupiter sell failed. Native: {}, Jupiter: {}", e, jupiter_error))
+                        }
                     }
+                } else {
+                    Err(e)
                 }
             }
         }
@@ -452,8 +445,21 @@ impl SimpleSellingEngine {
     where
         T: ProtocolSell,
     {
-        // Build swap instruction
-        let (keypair, instructions, price) = protocol.build_swap_from_parsed_data(trade_info, sell_config).await?;
+        // Get cached balance first
+        let cached_balance = if sell_config.swap_direction == SwapDirection::Sell {
+            // Get cached balance for selling
+            if let Some((raw, _decimal, decimals)) = BOUGHT_TOKENS.get_cached_balance(&trade_info.mint, 30) {
+                Some((raw, decimals))
+            } else {
+                self.logger.log(format!("No cached balance found for {}, cannot build sell transaction without RPC", trade_info.mint).red().to_string());
+                return Err(anyhow!("Cached balance required for selling, but not found"));
+            }
+        } else {
+            None
+        };
+
+        // Build swap instruction using cached balance
+        let (keypair, instructions, price) = protocol.build_swap_from_parsed_data_with_balance(trade_info, sell_config, cached_balance).await?;
         
         // Get recent blockhash
         let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
@@ -508,11 +514,16 @@ impl SimpleSellingEngine {
 /// Trait for protocol-specific sell operations
 trait ProtocolSell {
     fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> impl std::future::Future<Output = Result<(Arc<Keypair>, Vec<Instruction>, f64)>> + Send;
+    fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> impl std::future::Future<Output = Result<(Arc<Keypair>, Vec<Instruction>, f64)>> + Send;
 }
 
 impl ProtocolSell for Pump {
     async fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
         self.build_swap_from_parsed_data(trade_info, swap_config).await
+    }
+
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data_with_balance(trade_info, swap_config, cached_balance).await
     }
 }
 
@@ -520,10 +531,19 @@ impl ProtocolSell for PumpSwap {
     async fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
         self.build_swap_from_parsed_data(trade_info, swap_config).await
     }
+
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data_with_balance(trade_info, swap_config, cached_balance).await
+    }
 }
 
 impl ProtocolSell for crate::dex::raydium_launchpad::Raydium {
     async fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data(trade_info, swap_config).await
+    }
+
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        // Raydium should also implement the new method, for now fallback to old method
         self.build_swap_from_parsed_data(trade_info, swap_config).await
     }
 }

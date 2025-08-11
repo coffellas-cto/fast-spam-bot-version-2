@@ -195,17 +195,11 @@ impl PumpSwap {
                 swap_config.slippage as u64,
                 &mut instructions,
             ).await?,
-            SwapDirection::Sell => self.prepare_sell_swap_from_parsed(
-                trade_info,
-                owner,
-                mint,
-                pool_id,
-                coin_creator,
-                swap_config.amount_in,
-                swap_config.in_type,
-                swap_config.slippage as u64,
-                &mut instructions,
-            ).await?,
+            SwapDirection::Sell => {
+                // For selling, this method should not be called directly
+                // Use build_swap_from_parsed_data_with_balance instead
+                return Err(anyhow!("For selling, use build_swap_from_parsed_data_with_balance method with cached balance"));
+            },
         };
         
         // Add swap instruction if amount is valid
@@ -222,6 +216,98 @@ impl PumpSwap {
         }
         
         logger.log(format!("Built swap instruction in {:?}", start_time.elapsed()));
+        Ok((self.keypair.clone(), instructions, token_price))
+    }
+
+    /// Build swap transaction with cached token balance (for selling without RPC calls)
+    pub async fn build_swap_from_parsed_data_with_balance(
+        &self,
+        trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
+        swap_config: SwapConfig,
+        cached_balance: Option<(u64, u8)>, // (raw_balance, decimals) - None for buying
+    ) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        let logger = Logger::new("[PUMPSWAP-WITH-BALANCE] => ".blue().to_string());
+        let start_time = std::time::Instant::now();
+        
+        // Early validation
+        if trade_info.dex_type != DexType::PumpSwap {
+            return Err(anyhow!("Invalid transaction type"));
+        }
+        
+        let mint = Pubkey::from_str(&trade_info.mint)?;
+        let owner = self.keypair.pubkey();
+        
+        // Extract all needed data from TradeInfoFromToken
+        let pool_id = Pubkey::from_str(&trade_info.pool_id)?;
+        let coin_creator = if let Some(ref creator_str) = trade_info.coin_creator {
+            Pubkey::from_str(creator_str)?
+        } else {
+            return Err(anyhow!("Coin creator not found in trade info"));
+        };
+        
+        // Use virtual reserves from trade_info for calculations
+        let token_price = Self::calculate_price_from_virtual_reserves(
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        
+        logger.log(format!("Using cached balance for PumpSwap - Pool: {}, Price: {}", pool_id, token_price));
+        
+        // Prepare swap parameters
+        let (_token_in, _token_out, discriminator) = match swap_config.swap_direction {
+            SwapDirection::Buy => (*SOL_MINT, mint, *BUY_DISCRIMINATOR),
+            SwapDirection::Sell => (mint, *SOL_MINT, *SELL_DISCRIMINATOR),
+        };
+        
+        let mut instructions = Vec::with_capacity(3);
+        
+        // Process swap direction
+        let (base_amount, quote_amount, accounts) = match swap_config.swap_direction {
+            SwapDirection::Buy => self.prepare_buy_swap_from_parsed(
+                trade_info,
+                owner,
+                mint,
+                pool_id,
+                coin_creator,
+                swap_config.amount_in,
+                swap_config.slippage as u64,
+                &mut instructions,
+            ).await?,
+            SwapDirection::Sell => {
+                // Use cached balance for selling
+                if cached_balance.is_none() {
+                    return Err(anyhow!("Cached balance required for selling"));
+                }
+                
+                self.prepare_sell_swap_with_cached_balance(
+                    trade_info,
+                    owner,
+                    mint,
+                    pool_id,
+                    coin_creator,
+                    swap_config.amount_in,
+                    swap_config.in_type,
+                    swap_config.slippage as u64,
+                    cached_balance.unwrap(),
+                    &mut instructions,
+                ).await?
+            },
+        };
+        
+        // Add swap instruction if amount is valid
+        if base_amount > 0 {
+            instructions.push(create_swap_instruction(
+                *PUMP_SWAP_PROGRAM,
+                discriminator,
+                base_amount,
+                quote_amount,
+                accounts,
+            ));
+        } else {
+            return Err(anyhow!("Invalid swap amount"));
+        }
+        
+        logger.log(format!("Built swap instruction with cached balance in {:?}", start_time.elapsed()));
         Ok((self.keypair.clone(), instructions, token_price))
     }
     
@@ -371,6 +457,89 @@ impl PumpSwap {
             user_volume_accumulator,
         )?;
         
+        Ok((amount, min_quote_amount_out, accounts))
+    }
+
+    /// Prepare sell swap using cached balance instead of RPC calls
+    async fn prepare_sell_swap_with_cached_balance(
+        &self,
+        trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
+        owner: Pubkey,
+        mint: Pubkey,
+        pool_id: Pubkey,
+        coin_creator: Pubkey,
+        amount_in: f64,
+        in_type: SwapInType,
+        slippage_bps: u64,
+        cached_balance: (u64, u8), // (raw_balance, decimals)
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(u64, u64, Vec<AccountMeta>)> {
+        let in_ata = get_associated_token_address(&owner, &mint);
+        let (balance_raw, token_decimals) = cached_balance;
+        
+        // Calculate amount to sell from cached balance
+        let amount = match in_type {
+            SwapInType::Qty => ui_amount_to_amount(amount_in, token_decimals),
+            SwapInType::Pct => {
+                let pct = amount_in.min(1.0);
+                if pct == 1.0 {
+                    // Close account if selling 100%
+                    instructions.push(spl_token::instruction::close_account(
+                        &TOKEN_PROGRAM,
+                        &in_ata,
+                        &owner,
+                        &owner,
+                        &[&owner],
+                    )?);
+                    balance_raw
+                } else {
+                    (pct * balance_raw as f64) as u64
+                }
+            }
+        };
+        
+        if amount == 0 {
+            return Err(anyhow!("Invalid sell amount"));
+        }
+        
+        if amount > balance_raw {
+            return Err(anyhow!("Insufficient balance: trying to sell {} but only have {}", amount, balance_raw));
+        }
+        
+        // Use virtual reserves for calculation
+        let quote_amount_out = Self::calculate_sell_sol_amount(
+            amount,
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        
+        let min_quote_amount_out = 0;  // this ensures must sell
+        println!("Sell calculation - Tokens in: {} (from cached balance: {}), Expected SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}", 
+            amount, balance_raw, quote_amount_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves);
+        
+        // Create accounts using parsed pool_id and coin_creator
+        let pool_base_account = get_associated_token_address(&pool_id, &mint);
+        let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
+        
+        // Get volume accumulator PDAs
+        let global_volume_accumulator = get_global_volume_accumulator_pda()?;
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
+        
+        let accounts = create_sell_accounts(
+            pool_id,
+            owner,
+            mint,
+            *SOL_MINT,
+            in_ata,
+            get_associated_token_address(&owner, &SOL_MINT),
+            pool_base_account,
+            pool_quote_account,
+            coin_creator,
+            global_volume_accumulator,
+            user_volume_accumulator,
+        )?;
+        
+        // Return token amount in and min SOL amount out for sell orders
         Ok((amount, min_quote_amount_out, accounts))
     }
     
