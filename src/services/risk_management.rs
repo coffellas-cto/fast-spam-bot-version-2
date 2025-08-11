@@ -10,8 +10,7 @@ use reqwest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use base64;
-use anchor_client::solana_sdk::transaction::{VersionedTransaction, Transaction};
-use anchor_client::solana_sdk::message::{VersionedMessage, Message};
+use anchor_client::solana_sdk::transaction::Transaction;
 use anchor_client::solana_sdk::signature::Signer;
 use anchor_client::solana_sdk::instruction::Instruction;
 
@@ -530,79 +529,14 @@ impl RiskManagementService {
                     }
                 }
             }
-        } else if let Ok(versioned_transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
-            // Handle versioned transactions (Jupiter v6 API returns these)
-            self.logger.log("Handling versioned transaction from Jupiter".to_string());
-            
-            // Get recent blockhash
-            let recent_blockhash = self.app_state.rpc_client.get_latest_blockhash()
-                .map_err(|e| anyhow::anyhow!("Failed to get recent blockhash: {}", e))?;
-            
-            // For versioned transactions, we need to use a different approach
-            // We'll try to send it directly since Jupiter already prepared it
-            let mut signed_transaction = versioned_transaction;
-            
-            // Update blockhash if it's a legacy message within versioned transaction
-            match &mut signed_transaction.message {
-                VersionedMessage::Legacy(ref mut message) => {
-                    message.recent_blockhash = recent_blockhash;
-                },
-                VersionedMessage::V0(ref mut message) => {
-                    message.recent_blockhash = recent_blockhash;
-                }
-            }
-            
-            // Sign the versioned transaction
-            signed_transaction.sign(&[&self.app_state.wallet], recent_blockhash);
-            
-            // Send with retry logic
-            let mut attempts = 0;
-            let max_attempts = 3;
-            
-            while attempts < max_attempts {
-                attempts += 1;
-                
-                // Convert to raw transaction bytes for sending
-                let serialized = bincode::serialize(&signed_transaction)
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize transaction: {}", e))?;
-                
-                match self.app_state.rpc_client.send_raw_transaction(&serialized) {
-                    Ok(signature) => {
-                        self.logger.log(format!("Versioned swap transaction sent: {}", signature));
-                        
-                        // Wait for confirmation
-                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
-                            time::sleep(Duration::from_secs(1)).await;
-                            
-                            if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
-                                if let Some(result) = status {
-                                    if result.is_ok() {
-                                        self.logger.log(format!("Versioned swap transaction confirmed: {}", signature));
-                                        return Ok(signature.to_string());
-                                    } else {
-                                        return Err(anyhow::anyhow!("Transaction failed: {:?}", result));
-                                    }
-                                }
-                            }
-                        }
-                        
-                        return Err(anyhow::anyhow!("Transaction confirmation timeout"));
-                    },
-                    Err(e) => {
-                        self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
-                        
-                        if attempts >= max_attempts {
-                            return Err(anyhow::anyhow!("All versioned swap attempts failed. Last error: {}", e));
-                        }
-                        
-                        // Wait before retry
-                        time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
         } else {
-            return Err(anyhow::anyhow!("Failed to deserialize transaction as either Transaction or VersionedTransaction"));
+            // If we can't deserialize as legacy transaction, try a different approach
+            // This might be a versioned transaction, but for simplicity and compatibility,
+            // we'll return an error for now since the existing codebase uses legacy transactions
+            self.logger.log("Transaction format not supported - expected legacy transaction".yellow().to_string());
+            return Err(anyhow::anyhow!("Unsupported transaction format - only legacy transactions are supported"));
         }
+
         
         Err(anyhow::anyhow!("Maximum retry attempts exceeded"))
     }
