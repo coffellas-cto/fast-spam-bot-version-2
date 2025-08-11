@@ -606,7 +606,7 @@ impl SimpleSellingEngine {
             attempts += 1;
             
             // First check if the account exists at all
-            match self.app_state.rpc_nonblocking_client.get_account_info(ata).await {
+            match self.app_state.rpc_nonblocking_client.get_account(ata).await {
                 Ok(Some(account_info)) => {
                     self.logger.log(format!("Account {} exists, owner: {}, data length: {}", 
                         ata, account_info.owner, account_info.data.len()).cyan().to_string());
