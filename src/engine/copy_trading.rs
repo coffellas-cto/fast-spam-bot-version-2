@@ -14,7 +14,7 @@ use yellowstone_grpc_proto::geyser::{
 };
 use crate::engine::transaction_parser;
 use crate::common::{
-    config::{AppState, SwapConfig, JUPITER_PROGRAM, OKX_DEX_PROGRAM},
+    config::{AppState, SwapConfig},
     logger::Logger,
 };
 use crate::engine::swap::SwapProtocol;
@@ -156,9 +156,8 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
 
     // Create config for subscription
     let target_addresses = config.target_addresses.clone();
-    // Add excluded addresses
-    let mut excluded_addresses = vec![JUPITER_PROGRAM.to_string(), OKX_DEX_PROGRAM.to_string()];
-    excluded_addresses.extend(config.excluded_addresses.clone());
+    // Set excluded addresses to empty array to listen to all transactions
+    let excluded_addresses: Vec<String> = vec![];
     
     // Set up subscription
     logger.log("Setting up subscription...".green().to_string());
