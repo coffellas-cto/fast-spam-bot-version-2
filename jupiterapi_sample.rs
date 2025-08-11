@@ -654,7 +654,7 @@ async fn get_swap_instructions(
     quote: &Quote,
     user_public_key: &str
 ) -> Result<SwapInstructions> {
-    let url = "https://api.jup.ag/swap/v1/swap-instructions";
+    let url = "https://lite-api.jup.ag/swap/v1/swap-instructions";
     
     // Get Jupiter API key from environment variable
     let api_key = std::env::var("JUPITER_API_KEY").unwrap_or_else(|_| {

@@ -14,8 +14,8 @@ use tokio::time::Duration;
 
 use crate::common::logger::Logger;
 
-const JUPITER_API_URL: &str = "https://quote-api.jup.ag/v6";
-const JUPITER_SWAP_API_URL: &str = "https://api.jup.ag/swap/v1";
+const JUPITER_API_URL: &str = "https://lite-api.jup.ag/swap/v1/quote";
+const JUPITER_SWAP_API_URL: &str = "https://lite-api.jup.ag/swap/v1";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Serialize)]
