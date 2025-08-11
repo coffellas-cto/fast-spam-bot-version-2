@@ -119,17 +119,19 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
                     mint = meta.post_token_balances[0].mint.clone();
                     
                     // Check if this is a reverse case (WSOL is the first mint)
-                if mint == "So11111111111111111111111111111111111111112" {
+                    if mint == "So11111111111111111111111111111111111111112" {
                         is_reverse = true;
-                        // In reverse case, look for the second mint which should be the token
-                        if meta.post_token_balances.len() > 1 {
-                            mint = meta.post_token_balances[1].mint.clone();
-                            if mint == "So11111111111111111111111111111111111111112" {
-                                // In reverse case, look for the second mint which should be the token
-                                if meta.post_token_balances.len() > 2 {
-                                    mint = meta.post_token_balances[2].mint.clone();
-                                }
+                        // In reverse case, look for the first non-SOL mint
+                        for token_balance in &meta.post_token_balances {
+                            if token_balance.mint != "So11111111111111111111111111111111111111112" {
+                                mint = token_balance.mint.clone();
+                                break;
                             }
+                        }
+                        // If all mints are SOL (which shouldn't happen but just in case),
+                        // reset mint to empty so it uses the default
+                        if mint == "So11111111111111111111111111111111111111112" {
+                            mint = String::new();
                         }
                     }
                 }
