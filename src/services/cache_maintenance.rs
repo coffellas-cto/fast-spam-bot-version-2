@@ -72,4 +72,14 @@ impl CacheMaintenanceService {
             account_cache_size, mint_cache_size, balance_cache_size
         ).blue().to_string());
     }
+}
+
+/// Start the cache maintenance service with the specified cleanup interval
+pub async fn start_cache_maintenance(cleanup_interval_seconds: u64) {
+    let service = CacheMaintenanceService::new(cleanup_interval_seconds);
+    
+    // Spawn the maintenance loop in the background
+    tokio::spawn(async move {
+        service.start_maintenance_loop().await;
+    });
 } 
