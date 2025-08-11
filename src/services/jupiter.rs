@@ -216,8 +216,22 @@ impl JupiterClient {
         let recent_blockhash = self.rpc_client.get_latest_blockhash().await?;
         transaction.message.set_recent_blockhash(recent_blockhash);
 
-        // Sign the transaction
-        transaction.try_partial_sign(&[keypair], recent_blockhash)?;
+        // For VersionedTransaction, we need to manually create the signature
+        use anchor_client::solana_sdk::signer::Signer;
+        let message_data = transaction.message.serialize();
+        let signature = keypair.sign_message(&message_data);
+        
+        // Find the position of the keypair in the account keys to place the signature
+        let account_keys = transaction.message.static_account_keys();
+        if let Some(signer_index) = account_keys.iter().position(|key| *key == keypair.pubkey()) {
+            // Ensure we have enough signatures
+            if transaction.signatures.len() <= signer_index {
+                transaction.signatures.resize(signer_index + 1, anchor_client::solana_sdk::signature::Signature::default());
+            }
+            transaction.signatures[signer_index] = signature;
+        } else {
+            return Err(anyhow!("Keypair not found in transaction account keys"));
+        }
 
         // Send the transaction
         let signature = self.rpc_client.send_transaction(&transaction).await?;
