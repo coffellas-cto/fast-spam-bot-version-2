@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::{interval, sleep};
 use anyhow::Result;
 use colored::Colorize;
+use anchor_client::solana_sdk::signature::Signer;
 
 use crate::common::{
     config::AppState,
@@ -22,7 +23,7 @@ pub struct PeriodicSellerService {
 impl PeriodicSellerService {
     /// Create a new periodic selling service
     pub fn new(app_state: Arc<AppState>) -> Self {
-        let jupiter_client = JupiterClient::new(app_state.rpc_client.clone());
+        let jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
         
         // Check if periodic selling is enabled via environment variable
         let enabled = std::env::var("PERIODIC_SELLING_ENABLED")
@@ -318,8 +319,7 @@ impl PeriodicSellerService {
         self.logger.log(format!("Expected SOL output: {:.6}", expected_sol).blue().to_string());
         
         // Get wallet pubkey
-        let wallet_pubkey = self.app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow::anyhow!("Failed to get wallet pubkey: {}", e))?;
+        let wallet_pubkey = self.app_state.wallet.pubkey();
         
         // Get swap transaction from Jupiter
         let versioned_transaction = self.jupiter_client.get_swap_transaction(
@@ -327,8 +327,8 @@ impl PeriodicSellerService {
             &wallet_pubkey,
         ).await.map_err(|e| anyhow::anyhow!("Failed to get swap transaction: {}", e))?;
         
-        // Send the transaction
-        let signature = self.app_state.rpc_client.send_transaction(&versioned_transaction)
+        // Send the versioned transaction
+        let signature = self.app_state.rpc_nonblocking_client.send_transaction(&versioned_transaction).await
             .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
         
         self.logger.log(format!("Swap transaction sent: {}", signature).green().to_string());
@@ -341,7 +341,7 @@ impl PeriodicSellerService {
             sleep(Duration::from_secs(1)).await;
             confirmation_attempts += 1;
             
-            match self.app_state.rpc_client.get_signature_status(&signature) {
+            match self.app_state.rpc_nonblocking_client.get_signature_status(&signature).await {
                 Ok(Some(result)) if result.is_ok() => {
                     self.logger.log(format!("Transaction confirmed: {}", signature).green().to_string());
                     return Ok(expected_sol);
@@ -377,7 +377,7 @@ impl Clone for PeriodicSellerService {
     fn clone(&self) -> Self {
         Self {
             app_state: self.app_state.clone(),
-            jupiter_client: JupiterClient::new(self.app_state.rpc_client.clone()),
+            jupiter_client: JupiterClient::new(self.app_state.rpc_nonblocking_client.clone()),
             logger: Logger::new("[PERIODIC-SELLER] => ".magenta().to_string()),
             enabled: self.enabled,
         }
