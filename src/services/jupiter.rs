@@ -30,7 +30,7 @@ struct QuoteRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)] // Add Serialize derive
-struct QuoteResponse {
+pub struct QuoteResponse {
     #[serde(rename = "inputMint")]
     pub input_mint: String,
     #[serde(rename = "inAmount")]
@@ -321,5 +321,47 @@ impl JupiterClient {
                 Ok(false)
             }
         }
+    }
+    
+    /// High-level function to sell a token using Jupiter API
+    pub async fn sell_token(
+        &self,
+        input_mint: &str,
+        amount: u64,
+        slippage_bps: u64,
+        user_public_key: &Pubkey,
+    ) -> Result<(String, f64)> { // Returns (signature, expected_sol_amount)
+        let sol_mint = "So11111111111111111111111111111111111111112";
+        
+        // Skip if it's already SOL
+        if input_mint == sol_mint {
+            return Ok(("skip".to_string(), 0.0));
+        }
+        
+        // Get quote
+        let quote = self.get_quote(input_mint, sol_mint, amount, slippage_bps).await?;
+        
+        // Calculate expected SOL output
+        let expected_sol_raw = quote.out_amount.parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
+        let expected_sol = expected_sol_raw as f64 / 1e9;
+        
+        // Skip if expected output is too small
+        if expected_sol < 0.0001 {
+            return Err(anyhow!("Expected SOL output too small: {} SOL", expected_sol));
+        }
+        
+        self.logger.log(format!("Expected SOL output for {}: {:.6}", input_mint, expected_sol));
+        
+        // Get swap transaction
+        let versioned_transaction = self.get_swap_transaction(quote, user_public_key).await?;
+        
+        // Send transaction using the RPC client
+        let signature = self.rpc_client.send_transaction(&versioned_transaction).await
+            .map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
+        
+        self.logger.log(format!("Token sell transaction sent: {}", signature));
+        
+        Ok((signature.to_string(), expected_sol))
     }
 } 

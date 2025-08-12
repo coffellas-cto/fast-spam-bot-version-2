@@ -296,40 +296,21 @@ impl PeriodicSellerService {
     
     /// Attempt to sell using Jupiter API
     async fn attempt_jupiter_sell(&self, token_info: &crate::common::cache::BoughtTokenInfo, balance: &TokenBalance) -> Result<f64> {
-        let sol_mint = "So11111111111111111111111111111111111111112";
-        
-        // Get quote from Jupiter
-        let quote = self.jupiter_client.get_quote(
-            &token_info.mint,
-            sol_mint,
-            balance.amount_raw,
-            100, // 1% slippage
-        ).await.map_err(|e| anyhow::anyhow!("Failed to get Jupiter quote: {}", e))?;
-        
-        // Calculate expected SOL output
-        let expected_sol_raw = quote.out_amount.parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse output amount: {}", e))?;
-        let expected_sol = expected_sol_raw as f64 / 1e9;
-        
-        // Skip if expected output is too small (less than 0.0001 SOL)
-        if expected_sol < 0.0001 {
-            return Err(anyhow::anyhow!("Expected SOL output too small: {} SOL", expected_sol));
-        }
-        
-        self.logger.log(format!("Expected SOL output: {:.6}", expected_sol).blue().to_string());
-        
         // Get wallet pubkey
         let wallet_pubkey = self.app_state.wallet.pubkey();
         
-        // Get swap transaction from Jupiter
-        let versioned_transaction = self.jupiter_client.get_swap_transaction(
-            quote,
+        // Use the high-level sell function
+        let (signature, expected_sol) = self.jupiter_client.sell_token(
+            &token_info.mint,
+            balance.amount_raw,
+            100, // 1% slippage
             &wallet_pubkey,
-        ).await.map_err(|e| anyhow::anyhow!("Failed to get swap transaction: {}", e))?;
+        ).await.map_err(|e| anyhow::anyhow!("Failed to sell token: {}", e))?;
         
-        // Send the versioned transaction
-        let signature = self.app_state.rpc_nonblocking_client.send_transaction(&versioned_transaction).await
-            .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
+        // Skip if it was a SOL token
+        if signature == "skip" {
+            return Ok(0.0);
+        }
         
         self.logger.log(format!("Swap transaction sent: {}", signature).green().to_string());
         
@@ -341,7 +322,10 @@ impl PeriodicSellerService {
             sleep(Duration::from_secs(1)).await;
             confirmation_attempts += 1;
             
-            match self.app_state.rpc_nonblocking_client.get_signature_status(&signature).await {
+            let sig = anchor_client::solana_sdk::signature::Signature::from_str(&signature)
+                .map_err(|e| anyhow::anyhow!("Invalid signature: {}", e))?;
+            
+            match self.app_state.rpc_nonblocking_client.get_signature_status(&sig).await {
                 Ok(Some(result)) if result.is_ok() => {
                     self.logger.log(format!("Transaction confirmed: {}", signature).green().to_string());
                     return Ok(expected_sol);
