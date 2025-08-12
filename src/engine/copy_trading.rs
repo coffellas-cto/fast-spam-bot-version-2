@@ -280,11 +280,11 @@ async fn process_message(
         };
         
         if !inner_instructions.is_empty() {
-            // Find inner instruction with data length of 368, 270, 233, or 146 (Raydium Launchpad)
+            // Find inner instruction with data length of 368, 270, 266, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
                 .iter()
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 233 || ix.data.len() == 146)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 146)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {

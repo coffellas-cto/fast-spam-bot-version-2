@@ -424,7 +424,6 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
                 .unwrap_or_default()
                 .as_secs();
             
-                       
             // Calculate actual sol_change and token_change based on before/after reserves
             let sol_change_amount = (real_quote_after as i64 - real_quote_before as i64) as f64 / 1_000_000_000.0;
             let token_change_amount = (real_base_after as i64 - real_base_before as i64) as f64 / 1_000_000_000.0;
