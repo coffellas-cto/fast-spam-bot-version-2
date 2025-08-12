@@ -40,6 +40,30 @@ fn init_global_state() {
     BUYING_ENABLED.insert((), true);
 }
 
+/// Atomically try to increment the buy counter if it's below the limit
+/// Returns Some(new_value) if increment was successful, None if limit would be exceeded
+fn try_increment_buy_counter(counter_limit: u64) -> Option<u64> {
+    if let Some(mut counter_ref) = COUNTER.get_mut(&()) {
+        if *counter_ref < counter_limit {
+            *counter_ref += 1;
+            return Some(*counter_ref);
+        }
+    }
+    None
+}
+
+/// Atomically decrement the buy counter (for sells)
+/// Returns Some(new_value) if decrement was successful, None if counter was already 0
+fn decrement_buy_counter() -> Option<u64> {
+    if let Some(mut counter_ref) = COUNTER.get_mut(&()) {
+        if *counter_ref > 0 {
+            *counter_ref -= 1;
+            return Some(*counter_ref);
+        }
+    }
+    None
+}
+
 /// Get current counter status
 fn get_counter_status() -> (u64, u64, u64) {
     let counter = COUNTER.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
@@ -356,22 +380,24 @@ async fn handle_parsed_data(
             return Ok(());
         }
         
-        // Check counter limit before buying
-        if current_counter >= config.counter_limit {
-            logger.log(format!("Buy counter limit reached ({}/{}), skipping buy", current_counter, config.counter_limit).red().to_string());
-            return Ok(());
-        }
+        // Atomically try to increment counter - this prevents race conditions
+        let new_counter_value = match try_increment_buy_counter(config.counter_limit) {
+            Some(new_value) => new_value,
+            None => {
+                logger.log(format!("Buy counter limit reached ({}/{}), skipping buy", current_counter, config.counter_limit).red().to_string());
+                return Ok(());
+            }
+        };
         
-        // Execute buy
+        // Counter has been atomically incremented, now execute buy
+        logger.log(format!("Counter incremented to {}/{}, proceeding with buy", 
+            new_counter_value, config.counter_limit).cyan().to_string());
+        
         match selling_engine.execute_buy(&parsed_data).await {
             Ok(_) => {
                 logger.log(format!("Successfully executed BUY for token: {}", mint).green().to_string());
                 
-                // Update counters
-                if let Some(mut counter) = COUNTER.get_mut(&()) {
-                    *counter += 1;
-                    logger.log(format!("Buy counter increased to {}/{}", *counter, config.counter_limit).cyan().to_string());
-                }
+                // Update bought tokens counter (separate from buy counter)
                 if let Some(mut counter) = BOUGHT_TOKENS.get_mut(&()) {
                     *counter += 1;
                 }
@@ -385,6 +411,12 @@ async fn handle_parsed_data(
             Err(e) => {
                 logger.log(format!("Failed to execute BUY for token {}: {}", mint, e).red().to_string());
                 
+                // Buy failed, need to decrement counter since we incremented it earlier
+                if let Some(decremented_value) = decrement_buy_counter() {
+                    logger.log(format!("Decremented counter due to buy failure, now at {}/{}", 
+                        decremented_value, config.counter_limit).yellow().to_string());
+                }
+                
                 return Err(format!("Failed to execute buy: {}", e));
             }
         }
@@ -394,11 +426,8 @@ async fn handle_parsed_data(
         
         // Always decrease counter when target sells, even if we don't own the token
         // This maintains proper counter balance
-        if let Some(mut counter) = COUNTER.get_mut(&()) {
-            if *counter > 0 {
-                *counter -= 1;
-                logger.log(format!("Buy counter decreased to {}/{} (target sold)", *counter, config.counter_limit).cyan().to_string());
-            }
+        if let Some(decremented_value) = decrement_buy_counter() {
+            logger.log(format!("Buy counter decreased to {}/{} (target sold)", decremented_value, config.counter_limit).cyan().to_string());
         }
         
         // Execute sell
