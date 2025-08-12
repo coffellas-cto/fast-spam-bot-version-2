@@ -22,83 +22,53 @@ use crate::engine::selling_strategy::SimpleSellingEngine;
 use crate::services::token_monitor::TokenMonitor;
 use dashmap::DashMap;
 
-// Global state for copy trading
+// Global state for copy trading - simplified to only track statistics
 lazy_static::lazy_static! {
-    static ref COUNTER: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
-    static ref SOLD_TOKENS: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
-    static ref BOUGHT_TOKENS: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
+    static ref BOUGHT_COUNT: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
+    static ref SOLD_COUNT: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
     static ref LAST_BUY_TIME: Arc<DashMap<(), Option<Instant>>> = Arc::new(DashMap::new());
     static ref BUYING_ENABLED: Arc<DashMap<(), bool>> = Arc::new(DashMap::new());
 }
 
 // Initialize the global counters with default values
 fn init_global_state() {
-    COUNTER.insert((), 0);
-    SOLD_TOKENS.insert((), 0);
-    BOUGHT_TOKENS.insert((), 0);
+    BOUGHT_COUNT.insert((), 0);
+    SOLD_COUNT.insert((), 0);
     LAST_BUY_TIME.insert((), None);
     BUYING_ENABLED.insert((), true);
 }
 
-/// Atomically try to increment the buy counter if it's below the limit
-/// Returns Some(new_value) if increment was successful, None if limit would be exceeded
-fn try_increment_buy_counter(counter_limit: u64) -> Option<u64> {
-    if let Some(mut counter_ref) = COUNTER.get_mut(&()) {
-        if *counter_ref < counter_limit {
-            *counter_ref += 1;
-            return Some(*counter_ref);
-        }
-    }
-    None
+/// Get current statistics
+fn get_trading_stats() -> (u64, u64) {
+    let bought = BOUGHT_COUNT.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
+    let sold = SOLD_COUNT.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
+    (bought, sold)
 }
 
-/// Atomically decrement the buy counter (for sells)
-/// Returns Some(new_value) if decrement was successful, None if counter was already 0
-fn decrement_buy_counter() -> Option<u64> {
-    if let Some(mut counter_ref) = COUNTER.get_mut(&()) {
-        if *counter_ref > 0 {
-            *counter_ref -= 1;
-            return Some(*counter_ref);
-        }
-    }
-    None
+/// Log current trading statistics
+fn log_trading_stats(logger: &Logger) {
+    let (bought, sold) = get_trading_stats();
+    logger.log(format!("Trading Stats - Bought: {}, Sold: {}", bought, sold).blue().to_string());
 }
 
-/// Get current counter status
-fn get_counter_status() -> (u64, u64, u64) {
-    let counter = COUNTER.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
-    let bought = BOUGHT_TOKENS.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
-    let sold = SOLD_TOKENS.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
-    (counter, bought, sold)
+/// Reset statistics (useful for manual intervention)
+pub fn reset_stats() {
+    BOUGHT_COUNT.insert((), 0);
+    SOLD_COUNT.insert((), 0);
+    println!("Trading statistics reset successfully");
 }
 
-/// Log current counter status
-fn log_counter_status(logger: &Logger, counter_limit: u64) {
-    let (counter, bought, sold) = get_counter_status();
-    logger.log(format!("Counter Status - Buy Counter: {}/{}, Bought: {}, Sold: {}", 
-        counter, counter_limit, bought, sold).blue().to_string());
+/// Get current trading statistics (public function)
+pub fn get_current_trading_stats() -> (u64, u64) {
+    get_trading_stats()
 }
 
-/// Reset counter (useful for manual intervention)
-pub fn reset_counter() {
-    COUNTER.insert((), 0);
-    SOLD_TOKENS.insert((), 0);
-    BOUGHT_TOKENS.insert((), 0);
-    println!("Counter reset successfully");
-}
-
-/// Get current counter status (public function)
-pub fn get_current_counter_status() -> (u64, u64, u64) {
-    get_counter_status()
-}
-
-/// Configuration for copy trading
+/// Configuration for copy trading - removed counter_limit
 pub struct CopyTradingConfig {
     pub yellowstone_grpc_http: String,
     pub yellowstone_grpc_token: String,
     pub app_state: AppState,
     pub swap_config: SwapConfig,
-    pub counter_limit: u64,
     pub target_addresses: Vec<String>,
     pub excluded_addresses: Vec<String>,
     pub protocol_preference: SwapProtocol,
@@ -136,10 +106,10 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     logger.log("Initializing copy trading bot...".green().to_string());
     logger.log(format!("Target addresses: {:?}", config.target_addresses));
     logger.log(format!("Protocol preference: {:?}", config.protocol_preference));
-    logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string());
+    // logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string()); // Removed
     
     // Log initial counter status
-    log_counter_status(&logger, config.counter_limit);
+    log_trading_stats(&logger); // Changed to log_trading_stats
     
     // Connect to Yellowstone gRPC
     logger.log("Connecting to Yellowstone gRPC...".green().to_string());
@@ -227,7 +197,7 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     tokio::spawn(async move {
         loop {
             time::sleep(Duration::from_secs(60)).await;
-            log_counter_status(&logger_clone, config_clone.counter_limit);
+            log_trading_stats(&logger_clone); // Changed to log_trading_stats
         }
     });
 
@@ -343,9 +313,9 @@ async fn handle_parsed_data(
     let mint = parsed_data.mint.clone();
     
     // Log current counter status before processing
-    let (current_counter, bought_count, sold_count) = get_counter_status();
-    logger.log(format!("Processing transaction - Current Counter: {}/{}, Bought: {}, Sold: {}", 
-        current_counter, config.counter_limit, bought_count, sold_count).blue().to_string());
+    let (current_bought, current_sold) = get_trading_stats(); // Changed to get_trading_stats
+    logger.log(format!("Processing transaction - Current Bought: {}, Sold: {}", 
+        current_bought, current_sold).blue().to_string());
     
     // Log the parsed transaction data
     logger.log(format!(
@@ -380,42 +350,22 @@ async fn handle_parsed_data(
             return Ok(());
         }
         
-        // Atomically try to increment counter - this prevents race conditions
-        let new_counter_value = match try_increment_buy_counter(config.counter_limit) {
-            Some(new_value) => new_value,
-            None => {
-                logger.log(format!("Buy counter limit reached ({}/{}), skipping buy", current_counter, config.counter_limit).red().to_string());
-                return Ok(());
-            }
-        };
-        
-        // Counter has been atomically incremented, now execute buy
-        logger.log(format!("Counter incremented to {}/{}, proceeding with buy", 
-            new_counter_value, config.counter_limit).cyan().to_string());
+        // Execute buy
+        logger.log(format!("Proceeding with BUY for token: {}", mint).cyan().to_string());
         
         match selling_engine.execute_buy(&parsed_data).await {
             Ok(_) => {
                 logger.log(format!("Successfully executed BUY for token: {}", mint).green().to_string());
                 
-                // Update bought tokens counter (separate from buy counter)
-                if let Some(mut counter) = BOUGHT_TOKENS.get_mut(&()) {
+                // Update bought counter
+                if let Some(mut counter) = BOUGHT_COUNT.get_mut(&()) { // Changed to BOUGHT_COUNT
                     *counter += 1;
                 }
                 LAST_BUY_TIME.insert((), Some(Instant::now()));
                 
-                // Log token tracking status
-                let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
-                logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
-                
             },
             Err(e) => {
                 logger.log(format!("Failed to execute BUY for token {}: {}", mint, e).red().to_string());
-                
-                // Buy failed, need to decrement counter since we incremented it earlier
-                if let Some(decremented_value) = decrement_buy_counter() {
-                    logger.log(format!("Decremented counter due to buy failure, now at {}/{}", 
-                        decremented_value, config.counter_limit).yellow().to_string());
-                }
                 
                 return Err(format!("Failed to execute buy: {}", e));
             }
@@ -424,25 +374,15 @@ async fn handle_parsed_data(
         // Target is selling - we should sell too
         logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
         
-        // Always decrease counter when target sells, even if we don't own the token
-        // This maintains proper counter balance
-        if let Some(decremented_value) = decrement_buy_counter() {
-            logger.log(format!("Buy counter decreased to {}/{} (target sold)", decremented_value, config.counter_limit).cyan().to_string());
-        }
-        
         // Execute sell
         match selling_engine.execute_sell(&parsed_data).await {
             Ok(_) => {
                 logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
                 
                 // Update sold counter
-                if let Some(mut counter) = SOLD_TOKENS.get_mut(&()) {
+                if let Some(mut counter) = SOLD_COUNT.get_mut(&()) { // Changed to SOLD_COUNT
                     *counter += 1;
                 }
-                
-                // Log token tracking status
-                let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
-                logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
                 
             },
             Err(e) => {

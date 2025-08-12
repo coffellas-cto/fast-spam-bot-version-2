@@ -48,7 +48,6 @@ pub struct Config {
     pub yellowstone_grpc_token: String,
     pub app_state: AppState,
     pub swap_config: SwapConfig,
-    pub counter_limit: u32,
     pub transaction_landing_mode: TransactionLandingMode,
 }
 
@@ -66,7 +65,6 @@ impl Config {
             let yellowstone_grpc_http = import_env_var("YELLOWSTONE_GRPC_HTTP");
             let yellowstone_grpc_token = import_env_var("YELLOWSTONE_GRPC_TOKEN");
             let slippage_input = import_env_var_with_default("SLIPPAGE", "5000").parse::<u64>().unwrap_or(5000);
-            let counter_limit = import_env_var_with_default("COUNTER_LIMIT", "10").parse::<u32>().unwrap_or(10_u32);
             let transaction_landing_mode = import_env_var_with_default("TRANSACTION_LANDING_SERVICE", "zeroslot")
                 .parse::<TransactionLandingMode>()
                 .unwrap_or(TransactionLandingMode::default());
@@ -118,14 +116,13 @@ impl Config {
                     format!(
                     "[SNIPER ENVIRONMENT]: \n\t\t\t\t [Yellowstone gRpc]: {},
                     \n\t\t\t\t * [Wallet]: {:?}, * [Balance]: {} Sol, 
-                    \n\t\t\t\t * [Slippage]: {}, * [Solana]: {}, * [Amount]: {}, * [Counter Limit]: {}",
+                    \n\t\t\t\t * [Slippage]: {}, * [Solana]: {}, * [Amount]: {}",
                     yellowstone_grpc_http,
                     wallet_cloned.pubkey(),
                     balance as f64 / 1_000_000_000_f64,
                     slippage_input,
                     solana_price,
                     amount_in,
-                    counter_limit,
                 )
                 .purple()
                 .italic()
@@ -136,7 +133,6 @@ impl Config {
                 yellowstone_grpc_token,
                 app_state,
                 swap_config,
-                counter_limit,
                 transaction_landing_mode,
             })
         })

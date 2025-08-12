@@ -1216,7 +1216,6 @@ async fn main() {
         yellowstone_grpc_token: config.yellowstone_grpc_token.clone(),
         app_state: config.app_state.clone(),
         swap_config: config.swap_config.clone(),
-        counter_limit: config.counter_limit as u64,
         target_addresses: target_addresses.clone(),
         excluded_addresses,
         protocol_preference,
