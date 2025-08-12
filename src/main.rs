@@ -9,6 +9,7 @@
  * - Added caching and batch RPC calls for improved performance
  * - Added --sell command to sell all holding tokens using Jupiter API
  * - NEW: Automated risk management system with target wallet monitoring
+ * - NEW: Periodic selling system that sells all holdings every 2 minutes using Jupiter API
  * 
  * Usage Commands:
  * - cargo run -- --wrap       : Wrap SOL to WSOL (amount from WRAP_AMOUNT env var)
@@ -36,6 +37,8 @@
  * - RISK_MANAGEMENT_ENABLED: Enable/disable risk management (default: true)
  * - RISK_TARGET_TOKEN_THRESHOLD: Token threshold for risk alerts (default: 1000)
  * - RISK_CHECK_INTERVAL_MINUTES: Risk check interval in minutes (default: 10)
+ * - PERIODIC_SELLING_ENABLED: Enable/disable periodic selling (default: true)
+ * - PERIODIC_SELLING_INTERVAL_SECONDS: Selling interval in seconds (default: 120)
  * - Standard bot configuration variables (RPC URLs, wallet keys, etc.)
  * 
  * Risk Management:
@@ -43,6 +46,17 @@
  * If any target wallet has less than 1000 tokens (configurable) of any held token,
  * the system automatically sells ALL held tokens using Jupiter API, clears caches,
  * and resumes monitoring. This protects against following wallets that dump tokens.
+ * 
+ * Periodic Selling:
+ * The bot automatically sells all holdings every 2 minutes using Jupiter API to prevent
+ * accumulation of tokens when the copy trading bot misses selling transactions.
+ * Features include:
+ * - Pre-sale balance verification to ensure tokens still exist
+ * - Post-sale balance verification to confirm successful sales
+ * - Retry logic (up to 3 attempts) for failed transactions with existing balances
+ * - Automatic cache cleanup for successfully sold tokens
+ * - Smart balance checking with RPC fallback to cached values
+ * This feature can be disabled by setting PERIODIC_SELLING_ENABLED=false.
  */
 
 use anchor_client::solana_sdk::signature::Signer;
@@ -52,7 +66,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService, periodic_seller::PeriodicSellerService},
     core::token,
 };
 use solana_program_pack::Pack;
@@ -1226,6 +1240,21 @@ async fn main() {
     });
     
     println!("Risk management service started (checking every 10 minutes)");
+    
+    // Create and start the periodic selling service
+    let periodic_seller_service = PeriodicSellerService::new(
+        Arc::new(config.app_state.clone())
+    );
+    
+    // Start periodic selling service in background
+    let periodic_seller_clone = periodic_seller_service.clone();
+    tokio::spawn(async move {
+        if let Err(e) = periodic_seller_clone.start_periodic_selling().await {
+            eprintln!("Periodic selling error: {}", e);
+        }
+    });
+    
+    println!("Periodic selling service started (selling every 2 minutes)");
     
     // Start the copy trading bot
     if let Err(e) = start_copy_trading(copy_trading_config).await {
