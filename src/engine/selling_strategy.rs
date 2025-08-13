@@ -794,7 +794,7 @@ pub async fn emergency_sell_all_tokens(app_state: Arc<AppState>) -> Result<()> {
         slippage: 100, // 1% slippage
     });
     
-    let transaction_landing_mode = crate::common::config::TransactionLandingMode::ZeroSlot;
+    let transaction_landing_mode = crate::common::config::TransactionLandingMode::Zeroslot;
     
     sell_all_wallet_tokens_with_jupiter(app_state, swap_config, transaction_landing_mode).await
 } 

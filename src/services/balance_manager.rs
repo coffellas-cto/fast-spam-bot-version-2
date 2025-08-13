@@ -254,7 +254,7 @@ impl BalanceManager {
         let wallet_pubkey = self.app_state.wallet.try_pubkey()
             .map_err(|_| anyhow!("Failed to get wallet pubkey"))?;
         
-        let keypair = self.app_state.wallet.signer()?;
+        let keypair = self.app_state.wallet.clone();
         let wsol_mint = Pubkey::from_str(SOL_MINT)?;
         let wsol_ata = get_associated_token_address(&wallet_pubkey, &wsol_mint);
 
@@ -293,7 +293,7 @@ impl BalanceManager {
         let wallet_pubkey = self.app_state.wallet.try_pubkey()
             .map_err(|_| anyhow!("Failed to get wallet pubkey"))?;
             
-        let keypair = self.app_state.wallet.signer()?;
+        let keypair = self.app_state.wallet.clone();
         let wsol_mint = Pubkey::from_str(SOL_MINT)?;
         let wsol_ata = get_associated_token_address(&wallet_pubkey, &wsol_mint);
 
@@ -325,13 +325,13 @@ impl BalanceManager {
     }
 
     /// Send a transaction with the given instructions
-    async fn send_transaction(&self, instructions: Vec<Instruction>, signer: &Keypair) -> Result<()> {
+    async fn send_transaction(&self, instructions: Vec<Instruction>, signer: Arc<Keypair>) -> Result<()> {
         let recent_blockhash = self.rpc_client.get_latest_blockhash().await?;
         
         let transaction = anchor_client::solana_sdk::transaction::Transaction::new_signed_with_payer(
             &instructions,
             Some(&signer.pubkey()),
-            &[signer],
+            &[&*signer],
             recent_blockhash,
         );
 
