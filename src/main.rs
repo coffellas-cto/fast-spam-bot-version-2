@@ -8,6 +8,7 @@
  * - PumpFun protocol functionality remains unchanged
  * - Added caching and batch RPC calls for improved performance
  * - Added --sell command to sell all holding tokens using Jupiter API
+ * - Added --balance command to check and manage SOL/WSOL balance
  * - NEW: Automated risk management system with target wallet monitoring
  * - NEW: Periodic selling system that sells all holdings every 2 minutes using Jupiter API
  * 
@@ -16,6 +17,7 @@
  * - cargo run -- --unwrap     : Unwrap WSOL back to SOL
  * - cargo run -- --close      : Close all empty token accounts
  * - cargo run -- --sell       : Sell all holding tokens using Jupiter API
+ * - cargo run -- --balance    : Check and manage SOL/WSOL balance
  * - cargo run -- --check-tokens : Check token tracking status
  * - cargo run -- --risk-check : Run manual risk management check (NEW!)
  * - cargo run                  : Start copy trading bot with risk management
@@ -30,12 +32,28 @@
  *    - Gets swap transaction from Jupiter Swap API
  *    - Signs and executes the transaction via RPC
  *    - Waits for confirmation
- * 5. Reports successful sales and total SOL received
+ * 5. Automatically triggers SOL/WSOL balance management
+ * 6. Reports successful sales and total SOL received
+ * 
+ * The --balance command performs SOL/WSOL balance management:
+ * 1. Checks current SOL and WSOL balances
+ * 2. Calculates if rebalancing is needed (default: 20% deviation from 50/50 split)
+ * 3. Automatically wraps SOL to WSOL or unwraps WSOL to SOL as needed
+ * 4. Ensures optimal balance for both Pump.fun (SOL) and other DEXes (WSOL)
  * 
  * Environment Variables:
  * - WRAP_AMOUNT: Amount of SOL to wrap (default: 0.1)
  * - RISK_MANAGEMENT_ENABLED: Enable/disable risk management (default: true)
  * - RISK_TARGET_TOKEN_THRESHOLD: Token threshold for risk alerts (default: 1000)
+ * - PERIODIC_SELLING_ENABLED: Enable/disable periodic selling (default: true)
+ * - PERIODIC_SELLING_INTERVAL_SECONDS: Interval for periodic selling (default: 120)
+ * 
+ * Balance Management:
+ * The system automatically maintains optimal SOL/WSOL ratios for different DEXes:
+ * - Pump.fun requires native SOL for trading
+ * - Other DEXes (Raydium, etc.) require WSOL for trading
+ * - Default target: 50% SOL / 50% WSOL with 20% deviation threshold
+ * - Triggered automatically after Jupiter selling or manually via --balance
  * - RISK_CHECK_INTERVAL_MINUTES: Risk check interval in minutes (default: 10)
  * - PERIODIC_SELLING_ENABLED: Enable/disable periodic selling (default: true)
  * - PERIODIC_SELLING_INTERVAL_SECONDS: Selling interval in seconds (default: 120)
@@ -1087,6 +1105,36 @@ async fn main() {
                 },
                 Err(e) => {
                     eprintln!("Failed to sell all tokens: {}", e);
+                    return;
+                }
+            }
+        } else if args.contains(&"--balance".to_string()) {
+            println!("Checking and managing SOL/WSOL balance...");
+            
+            use solana_vntr_sniper::services::balance_manager::BalanceManager;
+            let balance_manager = BalanceManager::new(Arc::new(config.app_state.clone()));
+            
+            match balance_manager.get_current_balances().await {
+                Ok(balance_info) => {
+                    println!("Current balances:");
+                    println!("  SOL:   {:.6}", balance_info.sol_balance);
+                    println!("  WSOL:  {:.6}", balance_info.wsol_balance);
+                    println!("  Total: {:.6}", balance_info.total_balance);
+                    println!("  Ratio: {:.2}", balance_info.balance_ratio);
+                    
+                    if balance_manager.needs_rebalancing(&balance_info) {
+                        println!("\nRebalancing needed! Performing automatic rebalancing...");
+                        match balance_manager.rebalance().await {
+                            Ok(_) => println!("✅ Rebalancing completed successfully!"),
+                            Err(e) => eprintln!("❌ Rebalancing failed: {}", e),
+                        }
+                    } else {
+                        println!("\n✅ Balances are well balanced - no action needed");
+                    }
+                    return;
+                },
+                Err(e) => {
+                    eprintln!("Failed to check balances: {}", e);
                     return;
                 }
             }

@@ -11,12 +11,13 @@ use crate::common::{
     logger::Logger,
     cache::BOUGHT_TOKENS,
 };
-use crate::services::jupiter::JupiterClient;
+use crate::services::{jupiter::JupiterClient, balance_manager::BalanceManager};
 
 /// Periodic selling service that automatically sells all holdings every 2 minutes
 pub struct PeriodicSellerService {
     app_state: Arc<AppState>,
     jupiter_client: JupiterClient,
+    balance_manager: BalanceManager,
     logger: Logger,
     enabled: bool,
 }
@@ -25,6 +26,7 @@ impl PeriodicSellerService {
     /// Create a new periodic selling service
     pub fn new(app_state: Arc<AppState>) -> Self {
         let jupiter_client = JupiterClient::new(app_state.rpc_nonblocking_client.clone());
+        let balance_manager = BalanceManager::new(app_state.clone());
         
         // Check if periodic selling is enabled via environment variable
         let enabled = std::env::var("PERIODIC_SELLING_ENABLED")
@@ -35,6 +37,7 @@ impl PeriodicSellerService {
         Self {
             app_state,
             jupiter_client,
+            balance_manager,
             logger: Logger::new("[PERIODIC-SELLER] => ".magenta().to_string()),
             enabled,
         }
@@ -130,6 +133,16 @@ impl PeriodicSellerService {
                 failed_sales, 
                 total_sol_received
             ).blue().to_string());
+            
+            // Trigger SOL/WSOL balance management after selling
+            if successful_sales > 0 {
+                self.logger.log("Triggering SOL/WSOL balance management after successful sales...".cyan().to_string());
+                if let Err(e) = self.balance_manager.manage_balances_after_selling().await {
+                    self.logger.log(format!("Balance management failed: {}", e).red().to_string());
+                } else {
+                    self.logger.log("Balance management completed successfully".green().to_string());
+                }
+            }
         }
         
         Ok(())
@@ -363,6 +376,7 @@ impl Clone for PeriodicSellerService {
         Self {
             app_state: self.app_state.clone(),
             jupiter_client: JupiterClient::new(self.app_state.rpc_nonblocking_client.clone()),
+            balance_manager: BalanceManager::new(self.app_state.clone()),
             logger: Logger::new("[PERIODIC-SELLER] => ".magenta().to_string()),
             enabled: self.enabled,
         }

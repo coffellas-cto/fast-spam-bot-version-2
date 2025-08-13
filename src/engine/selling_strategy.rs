@@ -14,7 +14,7 @@ use crate::engine::transaction_parser::{TradeInfoFromToken, DexType};
 use crate::engine::swap::{SwapDirection, SwapProtocol, SwapInType};
 use crate::dex::pump_fun::Pump;
 use crate::dex::pump_swap::PumpSwap;
-use crate::services::jupiter::JupiterClient;
+use crate::services::{jupiter::JupiterClient, balance_manager::BalanceManager};
 use solana_sdk::signature::Signer;
 
 /// Token account information for bulk selling
@@ -474,12 +474,25 @@ impl SimpleSellingEngine {
         // Use 100 bps (1%) slippage for Jupiter
         let slippage_bps = 100;
         
-        jupiter_client.sell_token_with_jupiter(
+        let result = jupiter_client.sell_token_with_jupiter(
             token_mint,
             token_amount_raw,
             slippage_bps,
             &self.app_state.wallet
-        ).await
+        ).await;
+        
+        // Trigger balance management after successful Jupiter sell
+        if result.is_ok() {
+            self.logger.log("🔄 Triggering SOL/WSOL balance management after Jupiter sell...".cyan().to_string());
+            let balance_manager = BalanceManager::new(self.app_state.clone());
+            if let Err(e) = balance_manager.manage_balances_after_selling().await {
+                self.logger.log(format!("⚠️ Balance management failed: {}", e).red().to_string());
+            } else {
+                self.logger.log("✅ Balance management completed successfully".green().to_string());
+            }
+        }
+        
+        result
     }
 
     /// Public method to sell all tokens in wallet using Jupiter API
@@ -555,6 +568,17 @@ impl SimpleSellingEngine {
             successful_sales, failed_sales, skipped_tokens, total_sol_received
         ).cyan().bold().to_string());
         self.logger.log("=".repeat(60).cyan().to_string());
+        
+        // Trigger SOL/WSOL balance management after successful sales
+        if successful_sales > 0 {
+            self.logger.log("🔄 Triggering SOL/WSOL balance management after bulk selling...".cyan().to_string());
+            let balance_manager = BalanceManager::new(self.app_state.clone());
+            if let Err(e) = balance_manager.manage_balances_after_selling().await {
+                self.logger.log(format!("⚠️ Balance management failed: {}", e).red().to_string());
+            } else {
+                self.logger.log("✅ Balance management completed successfully".green().to_string());
+            }
+        }
         
         if failed_sales > 0 {
             Err(anyhow!("Some token sales failed: {} out of {}", failed_sales, successful_sales + failed_sales))
