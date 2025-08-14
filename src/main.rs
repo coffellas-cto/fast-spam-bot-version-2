@@ -301,13 +301,14 @@ async fn wrap_sol(config: &Config, amount: f64) -> Result<(), String> {
         ).map_err(|e| format!("Failed to create sync native instruction: {}", e))?
     );
     
-    // Send transaction using transaction landing mode
-    let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-        .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+    // Send transaction using zeroslot for minimal latency
+    let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+        Some(hash) => hash,
+        None => return Err("Failed to get recent blockhash for SOL wrapping".to_string()),
+    };
     
-    match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
-        config.transaction_landing_mode.clone(),
-        &config.app_state,
+    match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
+        config.app_state.zeroslot_rpc_client.clone(),
         recent_blockhash,
         &config.app_state.wallet,
         instructions,
@@ -364,13 +365,14 @@ async fn unwrap_sol(config: &Config) -> Result<(), String> {
         &[&wallet_pubkey],
     ).map_err(|e| format!("Failed to create close account instruction: {}", e))?;
     
-    // Send transaction using transaction landing mode
-    let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-        .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+    // Send transaction using zeroslot for minimal latency
+    let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+        Some(hash) => hash,
+        None => return Err("Failed to get recent blockhash for SOL unwrapping".to_string()),
+    };
     
-    match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
-        config.transaction_landing_mode.clone(),
-        &config.app_state,
+    match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
+        config.app_state.zeroslot_rpc_client.clone(),
         recent_blockhash,
         &config.app_state.wallet,
         vec![close_instruction],
@@ -453,13 +455,14 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
             &[&wallet_pubkey],
         ).map_err(|e| format!("Failed to create close instruction for {}: {}", token_account, e))?;
         
-        // Send transaction using transaction landing mode
-        let recent_blockhash = config.app_state.rpc_client.get_latest_blockhash()
-            .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+        // Send transaction using zeroslot for minimal latency
+        let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+            Some(hash) => hash,
+            None => return Err(format!("Failed to get recent blockhash for token account {}", token_account)),
+        };
         
-        match solana_vntr_sniper::core::tx::new_signed_and_send_with_landing_mode(
-            config.transaction_landing_mode.clone(),
-            &config.app_state,
+        match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
+            config.app_state.zeroslot_rpc_client.clone(),
             recent_blockhash,
             &config.app_state.wallet,
             vec![close_instruction],
@@ -793,10 +796,10 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Send the transaction
-            match config.app_state.rpc_client.send_transaction(&transaction) {
+            // Send the transaction using zeroslot for minimal latency
+            match config.app_state.zeroslot_rpc_client.send_transaction(&transaction).await {
                 Ok(signature) => {
-                    logger.log(format!("Versioned swap transaction sent: {}", signature));
+                    logger.log(format!("Versioned swap transaction sent via zeroslot: {}", signature));
                     
                     // Wait for confirmation
                     for _ in 0..30 { // Wait up to 30 seconds for confirmation
@@ -848,10 +851,10 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Send the transaction
-            match config.app_state.rpc_client.send_transaction(&transaction) {
+            // Send the transaction using zeroslot for minimal latency
+            match config.app_state.zeroslot_rpc_client.send_transaction(&transaction).await {
                 Ok(signature) => {
-                    logger.log(format!("Swap transaction sent: {}", signature));
+                    logger.log(format!("Swap transaction sent via zeroslot: {}", signature));
                     
                     // Wait for confirmation
                     for _ in 0..30 { // Wait up to 30 seconds for confirmation
