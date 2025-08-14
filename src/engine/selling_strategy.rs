@@ -321,7 +321,7 @@ impl SimpleSellingEngine {
                         sell_config.swap_direction = SwapDirection::Sell;
                         sell_config.amount_in = token_amount;
 
-                        match self.execute_sell_with_retries(trade_info, sell_config).await {
+                        match self.execute_sell_with_retries(trade_info, sell_config, (token_amount_raw, token_decimals)).await {
                             Ok(signature) => {
                                 self.logger.log(format!("Native sell fallback successful: {}", signature).green().to_string());
                                 Ok(())
@@ -341,8 +341,8 @@ impl SimpleSellingEngine {
         }
     }
 
-    /// Execute sell with retries using native protocols
-    async fn execute_sell_with_retries(&self, trade_info: &TradeInfoFromToken, sell_config: SwapConfig) -> Result<String> {
+    /// Execute sell with retries using native protocols with cached balance
+    async fn execute_sell_with_retries(&self, trade_info: &TradeInfoFromToken, sell_config: SwapConfig, cached_balance: (u64, u8)) -> Result<String> {
         const MAX_RETRIES: u32 = 3;
         let mut last_error: Option<anyhow::Error> = None;
 
@@ -359,7 +359,7 @@ impl SimpleSellingEngine {
                         self.app_state.wallet.clone(),
                     );
                     
-                    self.execute_protocol_sell(&pump, trade_info, sell_config.clone()).await
+                    self.execute_protocol_sell(&pump, trade_info, sell_config.clone(), cached_balance).await
                 },
                 SwapProtocol::PumpSwap => {
                     self.logger.log(format!("Sell attempt {} using PumpSwap protocol", attempt).blue().to_string());
@@ -370,7 +370,7 @@ impl SimpleSellingEngine {
                         Some(self.app_state.rpc_nonblocking_client.clone()),
                     );
                     
-                    self.execute_protocol_sell(&pump_swap, trade_info, sell_config.clone()).await
+                    self.execute_protocol_sell(&pump_swap, trade_info, sell_config.clone(), cached_balance).await
                 },
                 SwapProtocol::RaydiumLaunchpad => {
                     self.logger.log(format!("Sell attempt {} using RaydiumLaunchpad protocol", attempt).blue().to_string());
@@ -381,7 +381,7 @@ impl SimpleSellingEngine {
                         Some(self.app_state.rpc_nonblocking_client.clone()),
                     );
                     
-                    self.execute_protocol_sell(&raydium, trade_info, sell_config.clone()).await
+                    self.execute_protocol_sell(&raydium, trade_info, sell_config.clone(), cached_balance).await
                 },
                 _ => {
                     Err(anyhow!("Unsupported protocol for sell: {:?}", self.get_protocol_from_trade_info(trade_info)))
@@ -425,13 +425,17 @@ impl SimpleSellingEngine {
         Err(last_error.unwrap_or_else(|| anyhow!("All sell attempts failed")))
     }
 
-    /// Execute protocol-specific sell transaction
-    async fn execute_protocol_sell<T>(&self, protocol: &T, trade_info: &TradeInfoFromToken, sell_config: SwapConfig) -> Result<String>
+    /// Execute protocol-specific sell transaction with cached balance for minimal latency
+    async fn execute_protocol_sell<T>(&self, protocol: &T, trade_info: &TradeInfoFromToken, sell_config: SwapConfig, cached_balance: (u64, u8)) -> Result<String>
     where
-        T: ProtocolSell,
+        T: ProtocolSellWithBalance,
     {
-        // Build swap instruction using standard method
-        let (keypair, instructions, price) = protocol.build_swap_from_parsed_data(trade_info, sell_config).await?;
+        // Build swap instruction using cached balance method for faster execution
+        let (keypair, instructions, price) = protocol.build_swap_from_parsed_data_with_balance(
+            trade_info, 
+            sell_config, 
+            Some(cached_balance)
+        ).await?;
         
         // Get recent blockhash
         let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
@@ -441,12 +445,11 @@ impl SimpleSellingEngine {
             }
         };
         
-        self.logger.log(format!("Generated sell instruction at price: {}", price));
+        self.logger.log(format!("Generated sell instruction at price: {} using cached balance", price));
         
-        // Execute with transaction landing mode
-        match crate::core::tx::new_signed_and_send_with_landing_mode(
-            self.transaction_landing_mode.clone(),
-            &self.app_state,
+        // Use zeroslot directly for minimal latency selling
+        match crate::core::tx::new_signed_and_send_zeroslot(
+            self.app_state.zeroslot_rpc_client.clone(),
             recent_blockhash,
             &keypair,
             instructions,
@@ -746,25 +749,27 @@ impl SimpleSellingEngine {
     }
 }
 
-/// Trait for protocol-specific sell operations
-trait ProtocolSell {
-    fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> impl std::future::Future<Output = Result<(Arc<Keypair>, Vec<Instruction>, f64)>> + Send;
+/// Trait for protocol-specific sell operations with cached balance for minimal latency
+trait ProtocolSellWithBalance {
+    fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> impl std::future::Future<Output = Result<(Arc<Keypair>, Vec<Instruction>, f64)>> + Send;
 }
 
-impl ProtocolSell for Pump {
-    async fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
-        self.build_swap_from_parsed_data(trade_info, swap_config).await
+impl ProtocolSellWithBalance for Pump {
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data_with_balance(trade_info, swap_config, cached_balance).await
     }
 }
 
-impl ProtocolSell for PumpSwap {
-    async fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
-        self.build_swap_from_parsed_data(trade_info, swap_config).await
+impl ProtocolSellWithBalance for PumpSwap {
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data_with_balance(trade_info, swap_config, cached_balance).await
     }
 }
 
-impl ProtocolSell for crate::dex::raydium_launchpad::Raydium {
-    async fn build_swap_from_parsed_data(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+impl ProtocolSellWithBalance for crate::dex::raydium_launchpad::Raydium {
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, _cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        // Raydium doesn't have the cached balance method, so fallback to standard method
+        // This may have slightly higher latency but still better than Jupiter fallback
         self.build_swap_from_parsed_data(trade_info, swap_config).await
     }
 } 
