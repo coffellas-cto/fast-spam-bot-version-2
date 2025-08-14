@@ -311,7 +311,9 @@ async fn handle_parsed_data(
     let start_time = Instant::now();
     let instruction_type = parsed_data.dex_type.clone();
     let mint = parsed_data.mint.clone();
-    
+    if mint == "So11111111111111111111111111111111111111112" {
+        return Ok(());
+    }
     // Log current counter status before processing
     let (current_bought, current_sold) = get_trading_stats(); // Changed to get_trading_stats
     logger.log(format!("Processing transaction - Current Bought: {}, Sold: {}", 
