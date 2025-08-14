@@ -1093,7 +1093,7 @@ async fn main() {
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.1);
             
-            match wrap_sol(&config, &blockhash_processor, wrap_amount).await {
+            match wrap_sol(&config, wrap_amount).await {
                 Ok(_) => {
                     println!("Successfully wrapped {} SOL to WSOL", wrap_amount);
                     return;
@@ -1106,7 +1106,7 @@ async fn main() {
         } else if args.contains(&"--unwrap".to_string()) {
             println!("Unwrapping WSOL to SOL...");
             
-            match unwrap_sol(&config, &blockhash_processor).await {
+            match unwrap_sol(&config).await {
                 Ok(_) => {
                     println!("Successfully unwrapped WSOL to SOL");
                     return;
@@ -1119,7 +1119,7 @@ async fn main() {
         } else if args.contains(&"--close".to_string()) {
             println!("Closing all token accounts...");
             
-            match close_all_token_accounts(&config, &blockhash_processor).await {
+            match close_all_token_accounts(&config).await {
                 Ok(_) => {
                     println!("Successfully closed all token accounts");
                     return;
