@@ -1065,19 +1065,20 @@ async fn main() {
     println!("{}", run_msg);
     
     // Initialize blockhash processor
-    match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
+    let blockhash_processor = match BlockhashProcessor::new(config.app_state.rpc_client.clone()).await {
         Ok(processor) => {
             if let Err(e) = processor.start().await {
                 eprintln!("Failed to start blockhash processor: {}", e);
                 return;
             }
             println!("Blockhash processor started successfully");
+            processor
         },
         Err(e) => {
             eprintln!("Failed to initialize blockhash processor: {}", e);
             return;
         }
-    }
+    };
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -1092,7 +1093,7 @@ async fn main() {
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.1);
             
-            match wrap_sol(&config, wrap_amount).await {
+            match wrap_sol(&config, &blockhash_processor, wrap_amount).await {
                 Ok(_) => {
                     println!("Successfully wrapped {} SOL to WSOL", wrap_amount);
                     return;
@@ -1105,7 +1106,7 @@ async fn main() {
         } else if args.contains(&"--unwrap".to_string()) {
             println!("Unwrapping WSOL to SOL...");
             
-            match unwrap_sol(&config).await {
+            match unwrap_sol(&config, &blockhash_processor).await {
                 Ok(_) => {
                     println!("Successfully unwrapped WSOL to SOL");
                     return;
@@ -1118,7 +1119,7 @@ async fn main() {
         } else if args.contains(&"--close".to_string()) {
             println!("Closing all token accounts...");
             
-            match close_all_token_accounts(&config).await {
+            match close_all_token_accounts(&config, &blockhash_processor).await {
                 Ok(_) => {
                     println!("Successfully closed all token accounts");
                     return;
