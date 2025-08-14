@@ -796,10 +796,12 @@ async fn execute_swap_transaction(
         while attempts < max_attempts {
             attempts += 1;
             
-            // Send the transaction using zeroslot for minimal latency
-            match config.app_state.zeroslot_rpc_client.send_transaction(&transaction).await {
-                Ok(signature) => {
-                    logger.log(format!("Versioned swap transaction sent via zeroslot: {}", signature));
+            // Try to convert versioned transaction to legacy transaction for zeroslot compatibility
+            if let Ok(legacy_tx) = transaction.clone().into_legacy_transaction() {
+                // Send the legacy transaction using zeroslot for minimal latency
+                match config.app_state.zeroslot_rpc_client.send_transaction(&legacy_tx).await {
+                    Ok(signature) => {
+                        logger.log(format!("Versioned swap transaction sent via zeroslot: {}", signature));
                     
                     // Wait for confirmation
                     for _ in 0..30 { // Wait up to 30 seconds for confirmation
@@ -828,6 +830,42 @@ async fn execute_swap_transaction(
                     
                     // Wait before retry
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            } else {
+                // If conversion to legacy transaction fails, use normal RPC client as fallback
+                logger.log("Cannot convert versioned transaction to legacy, using normal RPC".yellow().to_string());
+                match config.app_state.rpc_client.send_transaction(&transaction) {
+                    Ok(signature) => {
+                        logger.log(format!("Versioned swap transaction sent via normal RPC: {}", signature));
+                        
+                        // Wait for confirmation
+                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            
+                            if let Ok(status) = config.app_state.rpc_client.get_signature_status(&signature) {
+                                if let Some(result) = status {
+                                    if result.is_ok() {
+                                        logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                        return Ok(signature.to_string());
+                                    } else {
+                                        return Err(format!("Transaction failed: {:?}", result));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return Err("Transaction confirmation timeout".to_string());
+                    },
+                    Err(e) => {
+                        logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                        
+                        if attempts >= max_attempts {
+                            return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                        }
+                        
+                        // Wait before retry
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
                 }
             }
         }
