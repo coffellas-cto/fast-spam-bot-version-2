@@ -280,7 +280,7 @@ impl BalanceManager {
         instructions.push(sync_native(&spl_token::id(), &wsol_ata)?);
 
         // Send transaction
-        self.send_transaction(instructions, &keypair).await?;
+        self.send_transaction(instructions, keypair).await?;
         
         self.logger.log(format!("Successfully wrapped {:.6} SOL to WSOL", amount).green().to_string());
         Ok(())
@@ -318,7 +318,7 @@ impl BalanceManager {
         )?);
 
         // Send transaction
-        self.send_transaction(instructions, &keypair).await?;
+        self.send_transaction(instructions, keypair).await?;
         
         self.logger.log(format!("Successfully unwrapped {:.6} WSOL to SOL", amount).green().to_string());
         Ok(())

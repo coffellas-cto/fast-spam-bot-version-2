@@ -3,7 +3,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, Result};
 use anchor_client::solana_sdk::{hash::Hash, instruction::Instruction, pubkey::Pubkey, signature::{Keypair, Signature}};
 use colored::Colorize;
-use spl_associated_token_address::get_associated_token_address;
+use spl_associated_token_account::get_associated_token_address;
 use spl_token;
 use solana_program_pack::Pack;
 use crate::common::{
