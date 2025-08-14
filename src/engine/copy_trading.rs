@@ -14,7 +14,7 @@ use yellowstone_grpc_proto::geyser::{
 };
 use crate::engine::transaction_parser;
 use crate::common::{
-    config::{AppState, SwapConfig, JUPITER_PROGRAM, OKX_DEX_PROGRAM},
+    config::{AppState, SwapConfig},
     logger::Logger,
 };
 use crate::engine::swap::SwapProtocol;
@@ -22,59 +22,53 @@ use crate::engine::selling_strategy::SimpleSellingEngine;
 use crate::services::token_monitor::TokenMonitor;
 use dashmap::DashMap;
 
-// Global state for copy trading
+// Global state for copy trading - simplified to only track statistics
 lazy_static::lazy_static! {
-    static ref COUNTER: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
-    static ref SOLD_TOKENS: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
-    static ref BOUGHT_TOKENS: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
+    static ref BOUGHT_COUNT: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
+    static ref SOLD_COUNT: Arc<DashMap<(), u64>> = Arc::new(DashMap::new());
     static ref LAST_BUY_TIME: Arc<DashMap<(), Option<Instant>>> = Arc::new(DashMap::new());
     static ref BUYING_ENABLED: Arc<DashMap<(), bool>> = Arc::new(DashMap::new());
 }
 
 // Initialize the global counters with default values
 fn init_global_state() {
-    COUNTER.insert((), 0);
-    SOLD_TOKENS.insert((), 0);
-    BOUGHT_TOKENS.insert((), 0);
+    BOUGHT_COUNT.insert((), 0);
+    SOLD_COUNT.insert((), 0);
     LAST_BUY_TIME.insert((), None);
     BUYING_ENABLED.insert((), true);
 }
 
-/// Get current counter status
-fn get_counter_status() -> (u64, u64, u64) {
-    let counter = COUNTER.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
-    let bought = BOUGHT_TOKENS.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
-    let sold = SOLD_TOKENS.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
-    (counter, bought, sold)
+/// Get current statistics
+fn get_trading_stats() -> (u64, u64) {
+    let bought = BOUGHT_COUNT.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
+    let sold = SOLD_COUNT.get(&()).map(|ref_val| *ref_val).unwrap_or(0);
+    (bought, sold)
 }
 
-/// Log current counter status
-fn log_counter_status(logger: &Logger, counter_limit: u64) {
-    let (counter, bought, sold) = get_counter_status();
-    logger.log(format!("Counter Status - Buy Counter: {}/{}, Bought: {}, Sold: {}", 
-        counter, counter_limit, bought, sold).blue().to_string());
+/// Log current trading statistics
+fn log_trading_stats(logger: &Logger) {
+    let (bought, sold) = get_trading_stats();
+    logger.log(format!("Trading Stats - Bought: {}, Sold: {}", bought, sold).blue().to_string());
 }
 
-/// Reset counter (useful for manual intervention)
-pub fn reset_counter() {
-    COUNTER.insert((), 0);
-    SOLD_TOKENS.insert((), 0);
-    BOUGHT_TOKENS.insert((), 0);
-    println!("Counter reset successfully");
+/// Reset statistics (useful for manual intervention)
+pub fn reset_stats() {
+    BOUGHT_COUNT.insert((), 0);
+    SOLD_COUNT.insert((), 0);
+    println!("Trading statistics reset successfully");
 }
 
-/// Get current counter status (public function)
-pub fn get_current_counter_status() -> (u64, u64, u64) {
-    get_counter_status()
+/// Get current trading statistics (public function)
+pub fn get_current_trading_stats() -> (u64, u64) {
+    get_trading_stats()
 }
 
-/// Configuration for copy trading
+/// Configuration for copy trading - removed counter_limit
 pub struct CopyTradingConfig {
     pub yellowstone_grpc_http: String,
     pub yellowstone_grpc_token: String,
     pub app_state: AppState,
     pub swap_config: SwapConfig,
-    pub counter_limit: u64,
     pub target_addresses: Vec<String>,
     pub excluded_addresses: Vec<String>,
     pub protocol_preference: SwapProtocol,
@@ -112,10 +106,10 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     logger.log("Initializing copy trading bot...".green().to_string());
     logger.log(format!("Target addresses: {:?}", config.target_addresses));
     logger.log(format!("Protocol preference: {:?}", config.protocol_preference));
-    logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string());
+    // logger.log(format!("Buy counter limit: {}", config.counter_limit).cyan().to_string()); // Removed
     
     // Log initial counter status
-    log_counter_status(&logger, config.counter_limit);
+    log_trading_stats(&logger); // Changed to log_trading_stats
     
     // Connect to Yellowstone gRPC
     logger.log("Connecting to Yellowstone gRPC...".green().to_string());
@@ -156,9 +150,8 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
 
     // Create config for subscription
     let target_addresses = config.target_addresses.clone();
-    // Add excluded addresses
-    let mut excluded_addresses = vec![JUPITER_PROGRAM.to_string(), OKX_DEX_PROGRAM.to_string()];
-    excluded_addresses.extend(config.excluded_addresses.clone());
+    // Set excluded addresses to empty array to listen to all transactions
+    let excluded_addresses: Vec<String> = vec![];
     
     // Set up subscription
     logger.log("Setting up subscription...".green().to_string());
@@ -204,7 +197,7 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
     tokio::spawn(async move {
         loop {
             time::sleep(Duration::from_secs(60)).await;
-            log_counter_status(&logger_clone, config_clone.counter_limit);
+            log_trading_stats(&logger_clone); // Changed to log_trading_stats
         }
     });
 
@@ -281,11 +274,11 @@ async fn process_message(
         };
         
         if !inner_instructions.is_empty() {
-            // Find inner instruction with data length of 368, 270, 233, or 146 (Raydium Launchpad)
+            // Find inner instruction with data length of 368, 270, 266, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
                 .iter()
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 233 || ix.data.len() == 146)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 146)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {
@@ -318,11 +311,13 @@ async fn handle_parsed_data(
     let start_time = Instant::now();
     let instruction_type = parsed_data.dex_type.clone();
     let mint = parsed_data.mint.clone();
-    
+    if mint == "So11111111111111111111111111111111111111112" {
+        return Ok(());
+    }
     // Log current counter status before processing
-    let (current_counter, bought_count, sold_count) = get_counter_status();
-    logger.log(format!("Processing transaction - Current Counter: {}/{}, Bought: {}, Sold: {}", 
-        current_counter, config.counter_limit, bought_count, sold_count).blue().to_string());
+    let (current_bought, current_sold) = get_trading_stats(); // Changed to get_trading_stats
+    logger.log(format!("Processing transaction - Current Bought: {}, Sold: {}", 
+        current_bought, current_sold).blue().to_string());
     
     // Log the parsed transaction data
     logger.log(format!(
@@ -357,30 +352,18 @@ async fn handle_parsed_data(
             return Ok(());
         }
         
-        // Check counter limit before buying
-        if current_counter >= config.counter_limit {
-            logger.log(format!("Buy counter limit reached ({}/{}), skipping buy", current_counter, config.counter_limit).red().to_string());
-            return Ok(());
-        }
-        
         // Execute buy
+        logger.log(format!("Proceeding with BUY for token: {}", mint).cyan().to_string());
+        
         match selling_engine.execute_buy(&parsed_data).await {
             Ok(_) => {
                 logger.log(format!("Successfully executed BUY for token: {}", mint).green().to_string());
                 
-                // Update counters
-                if let Some(mut counter) = COUNTER.get_mut(&()) {
-                    *counter += 1;
-                    logger.log(format!("Buy counter increased to {}/{}", *counter, config.counter_limit).cyan().to_string());
-                }
-                if let Some(mut counter) = BOUGHT_TOKENS.get_mut(&()) {
+                // Update bought counter
+                if let Some(mut counter) = BOUGHT_COUNT.get_mut(&()) { // Changed to BOUGHT_COUNT
                     *counter += 1;
                 }
                 LAST_BUY_TIME.insert((), Some(Instant::now()));
-                
-                // Log token tracking status
-                let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
-                logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
                 
             },
             Err(e) => {
@@ -393,28 +376,15 @@ async fn handle_parsed_data(
         // Target is selling - we should sell too
         logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
         
-        // Always decrease counter when target sells, even if we don't own the token
-        // This maintains proper counter balance
-        if let Some(mut counter) = COUNTER.get_mut(&()) {
-            if *counter > 0 {
-                *counter -= 1;
-                logger.log(format!("Buy counter decreased to {}/{} (target sold)", *counter, config.counter_limit).cyan().to_string());
-            }
-        }
-        
         // Execute sell
         match selling_engine.execute_sell(&parsed_data).await {
             Ok(_) => {
                 logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
                 
                 // Update sold counter
-                if let Some(mut counter) = SOLD_TOKENS.get_mut(&()) {
+                if let Some(mut counter) = SOLD_COUNT.get_mut(&()) { // Changed to SOLD_COUNT
                     *counter += 1;
                 }
-                
-                // Log token tracking status
-                let tracking_count = crate::common::cache::BOUGHT_TOKENS.size();
-                logger.log(format!("Now tracking {} tokens", tracking_count).blue().to_string());
                 
             },
             Err(e) => {

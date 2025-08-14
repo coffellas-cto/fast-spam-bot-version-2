@@ -1,11 +1,9 @@
 use std::time::Duration;
-use tokio::time;
+use tokio::time::interval;
+use crate::common::cache::{TOKEN_ACCOUNT_CACHE, TOKEN_MINT_CACHE, TOKEN_BALANCE_CACHE};
+use crate::common::logger::Logger;
 use colored::Colorize;
 
-use crate::common::logger::Logger;
-use crate::common::cache::{TOKEN_ACCOUNT_CACHE, TOKEN_MINT_CACHE};
-
-/// CacheMaintenanceService handles periodic cleanup of expired cache entries
 pub struct CacheMaintenanceService {
     logger: Logger,
     cleanup_interval: Duration,
@@ -14,52 +12,74 @@ pub struct CacheMaintenanceService {
 impl CacheMaintenanceService {
     pub fn new(cleanup_interval_seconds: u64) -> Self {
         Self {
-            logger: Logger::new("[CACHE-MAINTENANCE] => ".magenta().to_string()),
+            logger: Logger::new("[CACHE-MAINTENANCE] => ".cyan().to_string()),
             cleanup_interval: Duration::from_secs(cleanup_interval_seconds),
         }
     }
-    
-    /// Start the cache maintenance service
-    pub async fn start(self) {
+
+    pub async fn start_maintenance_loop(&self) {
         self.logger.log("Starting cache maintenance service".to_string());
         
-        let mut interval = time::interval(self.cleanup_interval);
+        let mut interval = interval(self.cleanup_interval);
         
         loop {
             interval.tick().await;
+            
             self.cleanup_expired_entries().await;
         }
     }
-    
-    /// Clean up expired cache entries
+
     async fn cleanup_expired_entries(&self) {
-        self.logger.log("Running cache cleanup".to_string());
+        let start_time = std::time::Instant::now();
         
         // Clean up token account cache
-        let token_account_count_before = TOKEN_ACCOUNT_CACHE.size();
+        let account_cache_size_before = TOKEN_ACCOUNT_CACHE.size();
         TOKEN_ACCOUNT_CACHE.clear_expired();
-        let token_account_count_after = TOKEN_ACCOUNT_CACHE.size();
+        let account_cache_size_after = TOKEN_ACCOUNT_CACHE.size();
         
         // Clean up token mint cache
-        let token_mint_count_before = TOKEN_MINT_CACHE.size();
+        let mint_cache_size_before = TOKEN_MINT_CACHE.size();
         TOKEN_MINT_CACHE.clear_expired();
-        let token_mint_count_after = TOKEN_MINT_CACHE.size();
+        let mint_cache_size_after = TOKEN_MINT_CACHE.size();
         
-        // Log cleanup results
+        // Clean up token balance cache
+        let balance_cache_size_before = TOKEN_BALANCE_CACHE.size();
+        TOKEN_BALANCE_CACHE.clear_stale();
+        let balance_cache_size_after = TOKEN_BALANCE_CACHE.size();
+        
+        let cleanup_duration = start_time.elapsed();
+        
+        if account_cache_size_before != account_cache_size_after || 
+           mint_cache_size_before != mint_cache_size_after ||
+           balance_cache_size_before != balance_cache_size_after {
+            self.logger.log(format!(
+                "Cache cleanup completed in {:?} - Account cache: {} -> {}, Mint cache: {} -> {}, Balance cache: {} -> {}",
+                cleanup_duration,
+                account_cache_size_before, account_cache_size_after,
+                mint_cache_size_before, mint_cache_size_after,
+                balance_cache_size_before, balance_cache_size_after
+            ).blue().to_string());
+        }
+    }
+
+    pub fn log_cache_stats(&self) {
+        let account_cache_size = TOKEN_ACCOUNT_CACHE.size();
+        let mint_cache_size = TOKEN_MINT_CACHE.size();
+        let balance_cache_size = TOKEN_BALANCE_CACHE.size();
+        
         self.logger.log(format!(
-            "Cache cleanup complete - Token accounts: {} -> {}, Token mints: {} -> {}",
-            token_account_count_before, token_account_count_after,
-            token_mint_count_before, token_mint_count_after
-        ));
+            "Cache stats - Account cache: {} entries, Mint cache: {} entries, Balance cache: {} entries",
+            account_cache_size, mint_cache_size, balance_cache_size
+        ).blue().to_string());
     }
 }
 
-/// Start the cache maintenance service in a background task
+/// Start the cache maintenance service with the specified cleanup interval
 pub async fn start_cache_maintenance(cleanup_interval_seconds: u64) {
     let service = CacheMaintenanceService::new(cleanup_interval_seconds);
     
-    // Spawn a background task for cache maintenance
+    // Spawn the maintenance loop in the background
     tokio::spawn(async move {
-        service.start().await;
+        service.start_maintenance_loop().await;
     });
 } 

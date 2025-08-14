@@ -4,17 +4,31 @@ use anyhow::{anyhow, Result};
 use anchor_client::solana_sdk::{hash::Hash, instruction::Instruction, pubkey::Pubkey, signature::{Keypair, Signature}};
 use colored::Colorize;
 use spl_associated_token_account::get_associated_token_address;
-
+use spl_token;
+use solana_program_pack::Pack;
 use crate::common::{
     config::{AppState, SwapConfig},
     logger::Logger,
-    cache::{WALLET_TOKEN_ACCOUNTS, BOUGHT_TOKENS},
 };
 use crate::engine::transaction_parser::{TradeInfoFromToken, DexType};
-use crate::engine::swap::{SwapDirection, SwapProtocol};
+use crate::engine::swap::{SwapDirection, SwapProtocol, SwapInType};
 use crate::dex::pump_fun::Pump;
 use crate::dex::pump_swap::PumpSwap;
+use crate::services::{jupiter::JupiterClient, balance_manager::BalanceManager};
 use solana_sdk::signature::Signer;
+
+/// Token account information for bulk selling
+#[derive(Debug, Clone)]
+pub struct WalletTokenInfo {
+    pub mint: String,
+    pub account_pubkey: Pubkey,
+    pub amount: f64,
+    pub amount_raw: u64,
+    pub decimals: u8,
+}
+
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 /// Simple selling engine for basic buy/sell operations
 #[derive(Clone)]
 pub struct SimpleSellingEngine {
@@ -38,7 +52,7 @@ impl SimpleSellingEngine {
         }
     }
     
-    /// Execute a buy operation when target buys
+    /// Execute a buy operation when target buys - simplified without tracking
     pub async fn execute_buy(&self, trade_info: &TradeInfoFromToken) -> Result<()> {
         self.logger.log(format!("Executing BUY for token: {}", trade_info.mint).green().to_string());
         
@@ -100,9 +114,6 @@ impl SimpleSellingEngine {
                                 let signature = &signatures[0];
                                 self.logger.log(format!("Buy transaction sent: {}", signature).green().to_string());
                                 
-                                // Track the bought token
-                                self.track_bought_token(trade_info, &signature.to_string(), "PumpFun").await?;
-                                
                                 Ok(())
                             },
                             Err(e) => {
@@ -163,9 +174,6 @@ impl SimpleSellingEngine {
                                     
                                     let signature = &signatures[0];
                                     self.logger.log(format!("Buy transaction sent: {}", signature).green().to_string());
-                                    
-                                    // Track the bought token
-                                    self.track_bought_token(trade_info, &signature.to_string(), "PumpSwap").await?;
                                     
                                     return Ok(());
                                 },
@@ -249,9 +257,6 @@ impl SimpleSellingEngine {
                                 let signature = &signatures[0];
                                 self.logger.log(format!("Buy transaction sent: {}", signature).green().to_string());
                                 
-                                // Track the bought token
-                                self.track_bought_token(trade_info, &signature.to_string(), "RaydiumLaunchpad").await?;
-                                
                                 Ok(())
                             },
                             Err(e) => {
@@ -272,250 +277,13 @@ impl SimpleSellingEngine {
         result
     }
     
-    /// Execute a sell operation when target sells
+    /// Execute a sell operation when target sells - always attempt regardless of tracking
     pub async fn execute_sell(&self, trade_info: &TradeInfoFromToken) -> Result<()> {
         self.logger.log(format!("Executing SELL for token: {}", trade_info.mint).red().to_string());
         
-        // First check if we actually own this token
-        if !BOUGHT_TOKENS.has_token(&trade_info.mint) {
-            self.logger.log(format!("We don't own token {}, skipping sell", trade_info.mint).yellow().to_string());
-            return Ok(());
-        }
+        // Always attempt to sell using Jupiter as primary method since we're not tracking ownership
+        self.logger.log("Attempting Jupiter sell for target token...".magenta().to_string());
         
-        // Get token info
-        let token_info = match BOUGHT_TOKENS.get_token_info(&trade_info.mint) {
-            Some(info) => info,
-            None => {
-                self.logger.log(format!("Token info not found for {}, skipping sell", trade_info.mint).yellow().to_string());
-                return Ok(());
-            }
-        };
-        
-        // Get wallet pubkey
-        let wallet_pubkey = self.app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
-
-        // Get token account to determine actual balance
-        let token_pubkey = Pubkey::from_str(&trade_info.mint)
-            .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
-        let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
-
-        // Get current token balance
-        let token_amount = match self.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
-            Ok(Some(account)) => {
-                let amount_value = account.token_amount.amount.parse::<f64>()
-                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
-                let decimal_amount = amount_value / 10f64.powi(account.token_amount.decimals as i32);
-                self.logger.log(format!("Selling {} tokens", decimal_amount).red().to_string());
-                decimal_amount
-            },
-            Ok(None) => {
-                self.logger.log(format!("No token account found for mint: {}, removing from tracking", trade_info.mint).yellow().to_string());
-                BOUGHT_TOKENS.remove_token(&trade_info.mint);
-                return Ok(());
-            },
-            Err(e) => {
-                return Err(anyhow!("Failed to get token account: {}", e));
-            }
-        };
-
-        if token_amount <= 0.0 {
-            self.logger.log("No tokens to sell, removing from tracking".yellow().to_string());
-            BOUGHT_TOKENS.remove_token(&trade_info.mint);
-            return Ok(());
-        }
-
-        // Create sell config
-        let mut sell_config = (*self.swap_config).clone();
-        sell_config.swap_direction = SwapDirection::Sell;
-        sell_config.amount_in = token_amount;
-
-        // Execute sell based on protocol
-        let result = match self.get_protocol_from_trade_info(trade_info) {
-            SwapProtocol::PumpFun => {
-                self.logger.log("Using PumpFun protocol for sell".red().to_string());
-                
-                let pump = Pump::new(
-                    self.app_state.rpc_nonblocking_client.clone(),
-                    self.app_state.rpc_client.clone(),
-                    self.app_state.wallet.clone(),
-                );
-                
-                match pump.build_swap_from_parsed_data(trade_info, sell_config).await {
-                    Ok((keypair, instructions, price)) => {
-                        // Get recent blockhash
-                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
-                            }
-                        };
-                        self.logger.log(format!("Generated PumpFun sell instruction at price: {}", price));
-                        
-                        // Execute with transaction landing mode
-                        match crate::core::tx::new_signed_and_send_with_landing_mode(
-                            self.transaction_landing_mode.clone(),
-                            &self.app_state,
-                            recent_blockhash,
-                            &keypair,
-                            instructions,
-                            &self.logger,
-                        ).await {
-                            Ok(signatures) => {
-                                if signatures.is_empty() {
-                                    return Err(anyhow!("No transaction signature returned"));
-                                }
-                                
-                                let signature = &signatures[0];
-                                self.logger.log(format!("Sell transaction sent: {}", signature).green().to_string());
-                                
-                                // Remove token from tracking after successful sell
-                                BOUGHT_TOKENS.remove_token(&trade_info.mint);
-                                self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
-                                
-                                Ok(())
-                            },
-                            Err(e) => {
-                                self.logger.log(format!("Sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send sell transaction: {}", e))
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        self.logger.log(format!("Failed to build PumpFun sell instruction: {}", e).red().to_string());
-                        Err(anyhow!("Failed to build sell instruction: {}", e))
-                    }
-                }
-            },
-            SwapProtocol::PumpSwap => {
-                self.logger.log("Using PumpSwap protocol for sell".red().to_string());
-                
-                let pump_swap = PumpSwap::new(
-                    self.app_state.wallet.clone(),
-                    Some(self.app_state.rpc_client.clone()),
-                    Some(self.app_state.rpc_nonblocking_client.clone()),
-                );
-                
-                match pump_swap.build_swap_from_parsed_data(trade_info, sell_config).await {
-                    Ok((keypair, instructions, price)) => {
-                        // Get recent blockhash
-                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
-                            }
-                        };
-                        self.logger.log(format!("Generated PumpSwap sell instruction at price: {}", price));
-                        
-                        // Execute with transaction landing mode
-                        match crate::core::tx::new_signed_and_send_with_landing_mode(
-                            self.transaction_landing_mode.clone(),
-                            &self.app_state,
-                            recent_blockhash,
-                            &keypair,
-                            instructions,
-                            &self.logger,
-                        ).await {
-                            Ok(signatures) => {
-                                if signatures.is_empty() {
-                                    return Err(anyhow!("No transaction signature returned"));
-                                }
-                                
-                                let signature = &signatures[0];
-                                self.logger.log(format!("Sell transaction sent: {}", signature).green().to_string());
-                                
-                                // Remove token from tracking after successful sell
-                                BOUGHT_TOKENS.remove_token(&trade_info.mint);
-                                self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
-                                
-                                Ok(())
-                            },
-                            Err(e) => {
-                                self.logger.log(format!("Sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send sell transaction: {}", e))
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        self.logger.log(format!("Failed to build PumpSwap sell instruction: {}", e).red().to_string());
-                        Err(anyhow!("Failed to build sell instruction: {}", e))
-                    }
-                }
-            },
-            SwapProtocol::RaydiumLaunchpad => {
-                self.logger.log("Using RaydiumLaunchpad protocol for sell".red().to_string());
-                
-                let raydium = crate::dex::raydium_launchpad::Raydium::new(
-                    self.app_state.wallet.clone(),
-                    Some(self.app_state.rpc_client.clone()),
-                    Some(self.app_state.rpc_nonblocking_client.clone()),
-                );
-                
-                match raydium.build_swap_from_parsed_data(trade_info, sell_config).await {
-                    Ok((keypair, instructions, price)) => {
-                        // Get recent blockhash
-                        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-                            Some(hash) => hash,
-                            None => {
-                                self.logger.log("Failed to get recent blockhash".red().to_string());
-                                return Err(anyhow!("Failed to get recent blockhash"));
-                            }
-                        };
-                        self.logger.log(format!("Generated RaydiumLaunchpad sell instruction at price: {}", price));
-                        
-                        // Execute with transaction landing mode
-                        match crate::core::tx::new_signed_and_send_with_landing_mode(
-                            self.transaction_landing_mode.clone(),
-                            &self.app_state,
-                            recent_blockhash,
-                            &keypair,
-                            instructions,
-                            &self.logger,
-                        ).await {
-                            Ok(signatures) => {
-                                if signatures.is_empty() {
-                                    return Err(anyhow!("No transaction signature returned"));
-                                }
-                                
-                                let signature = &signatures[0];
-                                self.logger.log(format!("Sell transaction sent: {}", signature).green().to_string());
-                                
-                                // Remove token from tracking after successful sell
-                                BOUGHT_TOKENS.remove_token(&trade_info.mint);
-                                self.logger.log(format!("Removed token {} from tracking after successful sell", trade_info.mint));
-                                
-                                Ok(())
-                            },
-                            Err(e) => {
-                                self.logger.log(format!("Sell transaction failed: {}", e).red().to_string());
-                                Err(anyhow!("Failed to send sell transaction: {}", e))
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        self.logger.log(format!("Failed to build RaydiumLaunchpad sell instruction: {}", e).red().to_string());
-                        Err(anyhow!("Failed to build sell instruction: {}", e))
-                    }
-                }
-            },
-            _ => {
-                return Err(anyhow!("Unsupported protocol for sell: {:?}", self.get_protocol_from_trade_info(trade_info)));
-            }
-        };
-
-        // Update token account list after sell
-        if result.is_ok() {
-            WALLET_TOKEN_ACCOUNTS.remove(&ata);
-            self.logger.log(format!("Removed token account {} from global list after sell", ata));
-        }
-
-        result
-    }
-    
-    /// Track a bought token
-    async fn track_bought_token(&self, trade_info: &TradeInfoFromToken, signature: &str, protocol: &str) -> Result<()> {
         // Get wallet pubkey
         let wallet_pubkey = self.app_state.wallet.try_pubkey()
             .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
@@ -525,18 +293,449 @@ impl SimpleSellingEngine {
             .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
         let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
         
-        // Add to bought tokens tracking
-        BOUGHT_TOKENS.add_bought_token(
-            trade_info.mint.clone(),
-            ata,
-            trade_info.token_change.abs(),
-            signature.to_string(),
-            protocol.to_string(),
-        );
+        // Try to get current token balance
+        match self.get_token_balance_direct(&trade_info.mint, &ata).await {
+            Ok((token_amount_raw, token_amount, token_decimals)) => {
+                if token_amount <= 0.0 {
+                    self.logger.log(format!("No balance found for token {}, skipping sell", trade_info.mint).yellow().to_string());
+                    return Ok(());
+                }
+                
+                self.logger.log(format!("Found balance for {}: {} tokens ({} raw units)", 
+                    trade_info.mint, token_amount, token_amount_raw).green().to_string());
+                
+                // Execute Jupiter sell with current balance
+                match self.execute_jupiter_sell(&trade_info.mint, token_amount_raw, token_decimals).await {
+                    Ok(signature) => {
+                        self.logger.log(format!("Jupiter sell successful: {}", signature).green().to_string());
+                        Ok(())
+                    },
+                    Err(jupiter_error) => {
+                        self.logger.log(format!("Jupiter sell failed: {}", jupiter_error).red().to_string());
+                        
+                        // Fallback to native protocols if Jupiter fails and we have balance info
+                        self.logger.log("Trying native protocols as fallback...".cyan().to_string());
+                        
+                        // Create sell config
+                        let mut sell_config = (*self.swap_config).clone();
+                        sell_config.swap_direction = SwapDirection::Sell;
+                        sell_config.amount_in = token_amount;
+
+                        match self.execute_sell_with_retries(trade_info, sell_config, (token_amount_raw, token_decimals)).await {
+                            Ok(signature) => {
+                                self.logger.log(format!("Native sell fallback successful: {}", signature).green().to_string());
+                                Ok(())
+                            },
+                            Err(native_error) => {
+                                self.logger.log(format!("Both Jupiter and native sell failed. Jupiter: {}, Native: {}", jupiter_error, native_error).red().to_string());
+                                Err(anyhow!("All sell attempts failed. Jupiter: {}, Native: {}", jupiter_error, native_error))
+                            }
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                self.logger.log(format!("No token account found for {}: {}", trade_info.mint, e).yellow().to_string());
+                Ok(()) // Not an error if we don't own the token
+            }
+        }
+    }
+
+    /// Execute sell with retries using native protocols with cached balance
+    async fn execute_sell_with_retries(&self, trade_info: &TradeInfoFromToken, sell_config: SwapConfig, cached_balance: (u64, u8)) -> Result<String> {
+        const MAX_RETRIES: u32 = 3;
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            self.logger.log(format!("Sell attempt {}/{} for token: {}", attempt, MAX_RETRIES, trade_info.mint).cyan().to_string());
+            
+            let result = match self.get_protocol_from_trade_info(trade_info) {
+                SwapProtocol::PumpFun => {
+                    self.logger.log(format!("Sell attempt {} using PumpFun protocol", attempt).blue().to_string());
+                    
+                    let pump = Pump::new(
+                        self.app_state.rpc_nonblocking_client.clone(),
+                        self.app_state.rpc_client.clone(),
+                        self.app_state.wallet.clone(),
+                    );
+                    
+                    self.execute_protocol_sell(&pump, trade_info, sell_config.clone(), cached_balance).await
+                },
+                SwapProtocol::PumpSwap => {
+                    self.logger.log(format!("Sell attempt {} using PumpSwap protocol", attempt).blue().to_string());
+                    
+                    let pump_swap = PumpSwap::new(
+                        self.app_state.wallet.clone(),
+                        Some(self.app_state.rpc_client.clone()),
+                        Some(self.app_state.rpc_nonblocking_client.clone()),
+                    );
+                    
+                    self.execute_protocol_sell(&pump_swap, trade_info, sell_config.clone(), cached_balance).await
+                },
+                SwapProtocol::RaydiumLaunchpad => {
+                    self.logger.log(format!("Sell attempt {} using RaydiumLaunchpad protocol", attempt).blue().to_string());
+                    
+                    let raydium = crate::dex::raydium_launchpad::Raydium::new(
+                        self.app_state.wallet.clone(),
+                        Some(self.app_state.rpc_client.clone()),
+                        Some(self.app_state.rpc_nonblocking_client.clone()),
+                    );
+                    
+                    self.execute_protocol_sell(&raydium, trade_info, sell_config.clone(), cached_balance).await
+                },
+                _ => {
+                    Err(anyhow!("Unsupported protocol for sell: {:?}", self.get_protocol_from_trade_info(trade_info)))
+                }
+            };
+
+            match result {
+                Ok(signature) => {
+                    // Verify transaction success
+                    let jupiter_client = JupiterClient::new(self.app_state.rpc_nonblocking_client.clone());
+                    match jupiter_client.verify_transaction(&signature).await {
+                        Ok(true) => {
+                            self.logger.log(format!("Sell attempt {} verified successfully: {}", attempt, signature).green().to_string());
+                            return Ok(signature);
+                        },
+                        Ok(false) => {
+                            let error_msg = format!("Sell attempt {} transaction failed verification: {}", attempt, signature);
+                            self.logger.log(error_msg.clone().red().to_string());
+                            last_error = Some(anyhow!(error_msg));
+                        },
+                        Err(e) => {
+                            let error_msg = format!("Sell attempt {} verification error: {}", attempt, e);
+                            self.logger.log(error_msg.clone().red().to_string());
+                            last_error = Some(anyhow!(error_msg));
+                        }
+                    }
+                },
+                Err(e) => {
+                    self.logger.log(format!("Sell attempt {} failed: {}", attempt, e).red().to_string());
+                    last_error = Some(e);
+                }
+            }
+
+            // Wait before retry (except on last attempt)
+            if attempt < MAX_RETRIES {
+                self.logger.log(format!("Waiting 2 seconds before retry attempt {}...", attempt + 1).yellow().to_string());
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("All sell attempts failed")))
+    }
+
+    /// Execute protocol-specific sell transaction with cached balance for minimal latency
+    async fn execute_protocol_sell<T>(&self, protocol: &T, trade_info: &TradeInfoFromToken, sell_config: SwapConfig, cached_balance: (u64, u8)) -> Result<String>
+    where
+        T: ProtocolSellWithBalance,
+    {
+        // Build swap instruction using cached balance method for faster execution
+        let (keypair, instructions, price) = protocol.build_swap_from_parsed_data_with_balance(
+            trade_info, 
+            sell_config, 
+            Some(cached_balance)
+        ).await?;
         
-        self.logger.log(format!("Added token {} to bought tokens tracking", trade_info.mint).green().to_string());
+        // Get recent blockhash
+        let recent_blockhash = match crate::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
+            Some(hash) => hash,
+            None => {
+                return Err(anyhow!("Failed to get recent blockhash"));
+            }
+        };
         
-        Ok(())
+        self.logger.log(format!("Generated sell instruction at price: {} using cached balance", price));
+        
+        // Use zeroslot directly for minimal latency selling
+        match crate::core::tx::new_signed_and_send_zeroslot(
+            self.app_state.zeroslot_rpc_client.clone(),
+            recent_blockhash,
+            &keypair,
+            instructions,
+            &self.logger,
+        ).await {
+            Ok(signatures) => {
+                if signatures.is_empty() {
+                    return Err(anyhow!("No transaction signature returned"));
+                }
+                
+                Ok(signatures[0].clone())
+            },
+            Err(e) => {
+                Err(anyhow!("Failed to send sell transaction: {}", e))
+            }
+        }
+    }
+
+    /// Execute Jupiter sell as fallback
+    async fn execute_jupiter_sell(&self, token_mint: &str, token_amount_raw: u64, _token_decimals: u8) -> Result<String> {
+        self.logger.log(format!("Executing Jupiter fallback sell for token: {} (amount: {})", token_mint, token_amount_raw).magenta().to_string());
+        
+        let jupiter_client = JupiterClient::new(self.app_state.rpc_nonblocking_client.clone());
+        
+        // Use 100 bps (1%) slippage for Jupiter
+        let slippage_bps = 100;
+        
+        let result = jupiter_client.sell_token_with_jupiter(
+            token_mint,
+            token_amount_raw,
+            slippage_bps,
+            &self.app_state.wallet
+        ).await;
+        
+        // Trigger balance management after successful Jupiter sell
+        if result.is_ok() {
+            self.logger.log("🔄 Triggering SOL/WSOL balance management after Jupiter sell...".cyan().to_string());
+            let balance_manager = BalanceManager::new(self.app_state.clone());
+            if let Err(e) = balance_manager.manage_balances_after_selling().await {
+                self.logger.log(format!("⚠️ Balance management failed: {}", e).red().to_string());
+            } else {
+                self.logger.log("✅ Balance management completed successfully".green().to_string());
+            }
+        }
+        
+        result
+    }
+
+    /// Public method to sell all tokens in wallet using Jupiter API
+    /// This mimics the functionality of "cargo r -- --sell" command
+    pub async fn sell_all_tokens(&self) -> Result<()> {
+        self.logger.log("🚀 Starting bulk sell operation using Jupiter API".cyan().bold().to_string());
+        
+        // Discover all token accounts
+        let token_accounts = self.discover_wallet_tokens().await?;
+        
+        if token_accounts.is_empty() {
+            self.logger.log("ℹ️  No tokens found to sell".yellow().to_string());
+            return Ok(());
+        }
+        
+        self.logger.log(format!("📊 Found {} tokens to potentially sell", token_accounts.len()).blue().to_string());
+        
+        let mut successful_sales = 0;
+        let mut failed_sales = 0;
+        let mut total_sol_received = 0.0;
+        let mut skipped_tokens = 0;
+        
+        // Sell each token using Jupiter
+        for (index, token) in token_accounts.iter().enumerate() {
+            self.logger.log(format!("🔄 Processing token {}/{}: {}", 
+                index + 1, token_accounts.len(), token.mint).cyan().to_string());
+            
+            // Skip SOL and WSOL
+            if token.mint == SOL_MINT || token.mint == WSOL_MINT {
+                self.logger.log(format!("⏭️  Skipping SOL/WSOL token: {}", token.mint).yellow().to_string());
+                skipped_tokens += 1;
+                continue;
+            }
+            
+            // Check if token has meaningful value (skip dust)
+            if token.amount <= 0.000001 {
+                self.logger.log(format!("⏭️  Skipping dust token {}: {} amount", token.mint, token.amount).yellow().to_string());
+                skipped_tokens += 1;
+                continue;
+            }
+            
+            self.logger.log(format!("💰 Attempting to sell token: {} (amount: {}, raw: {})", 
+                token.mint, token.amount, token.amount_raw).green().to_string());
+            
+            match self.sell_single_token_jupiter(token).await {
+                Ok(signature) => {
+                    self.logger.log(format!("✅ Successfully sold token {}: {}", token.mint, signature).green().bold().to_string());
+                    successful_sales += 1;
+                    
+                    // Try to estimate SOL received (this is approximate)
+                    if let Ok(sol_estimate) = self.estimate_sol_output(&token.mint, token.amount_raw).await {
+                        total_sol_received += sol_estimate;
+                        self.logger.log(format!("💎 Estimated SOL received: {:.6}", sol_estimate).cyan().to_string());
+                    }
+                },
+                Err(e) => {
+                    self.logger.log(format!("❌ Failed to sell token {}: {}", token.mint, e).red().to_string());
+                    failed_sales += 1;
+                }
+            }
+            
+            // Add delay between swaps to avoid rate limiting
+            if index < token_accounts.len() - 1 {
+                self.logger.log("⏰ Waiting 1.5s to avoid rate limiting...".blue().to_string());
+                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+            }
+        }
+        
+        // Final summary
+        self.logger.log("=".repeat(60).cyan().to_string());
+        self.logger.log(format!(
+            "🎯 Bulk selling completed!\n   ✅ {} successful\n   ❌ {} failed\n   ⏭️  {} skipped\n   💰 ~{:.6} SOL received",
+            successful_sales, failed_sales, skipped_tokens, total_sol_received
+        ).cyan().bold().to_string());
+        self.logger.log("=".repeat(60).cyan().to_string());
+        
+        // Trigger SOL/WSOL balance management after successful sales
+        if successful_sales > 0 {
+            self.logger.log("🔄 Triggering SOL/WSOL balance management after bulk selling...".cyan().to_string());
+            let balance_manager = BalanceManager::new(self.app_state.clone());
+            if let Err(e) = balance_manager.manage_balances_after_selling().await {
+                self.logger.log(format!("⚠️ Balance management failed: {}", e).red().to_string());
+            } else {
+                self.logger.log("✅ Balance management completed successfully".green().to_string());
+            }
+        }
+        
+        if failed_sales > 0 {
+            Err(anyhow!("Some token sales failed: {} out of {}", failed_sales, successful_sales + failed_sales))
+        } else {
+            Ok(())
+        }
+    }
+    
+    /// Discover all token accounts in the wallet
+    async fn discover_wallet_tokens(&self) -> Result<Vec<WalletTokenInfo>> {
+        self.logger.log("Discovering wallet token accounts...".blue().to_string());
+        
+        let wallet_pubkey = self.app_state.wallet.try_pubkey()
+            .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
+        
+        // Get the token program pubkey
+        let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
+        
+        // Query all token accounts owned by the wallet
+        let accounts = self.app_state.rpc_client.get_token_accounts_by_owner(
+            &wallet_pubkey,
+            anchor_client::solana_client::rpc_request::TokenAccountsFilter::ProgramId(token_program)
+        ).map_err(|e| anyhow!("Failed to get token accounts: {}", e))?;
+        
+        let mut token_accounts = Vec::new();
+        
+        for account_info in accounts {
+            let token_account_pubkey = Pubkey::from_str(&account_info.pubkey)
+                .map_err(|_| anyhow!("Invalid token account pubkey: {}", account_info.pubkey))?;
+            
+            // Get account data
+            let account_data = match self.app_state.rpc_client.get_account(&token_account_pubkey) {
+                Ok(data) => data,
+                Err(e) => {
+                    self.logger.log(format!("Failed to get account data for {}: {}", token_account_pubkey, e).yellow().to_string());
+                    continue;
+                }
+            };
+            
+            // Parse token account data
+            if let Ok(token_data) = spl_token::state::Account::unpack(&account_data.data) {
+                if token_data.amount > 0 {
+                    // Get proper decimals from mint account
+                    let decimals = match self.app_state.rpc_client.get_account(&token_data.mint) {
+                        Ok(mint_account) => {
+                            if let Ok(mint_data) = spl_token::state::Mint::unpack(&mint_account.data) {
+                                mint_data.decimals
+                            } else {
+                                9 // Default decimals
+                            }
+                        },
+                        Err(_) => 9 // Default decimals
+                    };
+                    
+                    // Convert amount to UI amount using proper decimals
+                    let ui_amount = token_data.amount as f64 / 10f64.powi(decimals as i32);
+                    
+                    if ui_amount > 0.0 {
+                        token_accounts.push(WalletTokenInfo {
+                            mint: token_data.mint.to_string(),
+                            account_pubkey: token_account_pubkey,
+                            amount: ui_amount,
+                            amount_raw: token_data.amount,
+                            decimals,
+                        });
+                        
+                        self.logger.log(format!("Found token: {} (amount: {}, raw: {})", 
+                            token_data.mint, ui_amount, token_data.amount).green().to_string());
+                    }
+                }
+            }
+        }
+        
+        self.logger.log(format!("Discovered {} token accounts with balances", token_accounts.len()).blue().to_string());
+        Ok(token_accounts)
+    }
+    
+    /// Sell a single token using Jupiter API
+    async fn sell_single_token_jupiter(&self, token: &WalletTokenInfo) -> Result<String> {
+        self.logger.log(format!("Selling token {} using Jupiter API (amount: {})", token.mint, token.amount_raw).magenta().to_string());
+        
+        let jupiter_client = JupiterClient::new(self.app_state.rpc_nonblocking_client.clone());
+        
+        // Use 100 bps (1%) slippage for Jupiter
+        let slippage_bps = 100;
+        
+        // Get quote first to check if swap is viable
+        match jupiter_client.get_quote(&token.mint, SOL_MINT, token.amount_raw, slippage_bps).await {
+            Ok(quote) => {
+                // Parse expected output
+                let expected_sol_raw = quote.out_amount.parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
+                let expected_sol = expected_sol_raw as f64 / 1e9;
+                
+                // Check if expected output is worthwhile (more than 0.0001 SOL)
+                if expected_sol < 0.0001 {
+                    return Err(anyhow!("Expected SOL output too small: {} SOL", expected_sol));
+                }
+                
+                self.logger.log(format!("Expected SOL output for {}: {:.6}", token.mint, expected_sol).cyan().to_string());
+                
+                // Execute the sell
+                jupiter_client.sell_token_with_jupiter(
+                    &token.mint,
+                    token.amount_raw,
+                    slippage_bps,
+                    &self.app_state.wallet
+                ).await
+            },
+            Err(e) => {
+                Err(anyhow!("Failed to get Jupiter quote for {}: {}", token.mint, e))
+            }
+        }
+    }
+    
+    /// Estimate SOL output for a token sale (for reporting purposes)
+    async fn estimate_sol_output(&self, token_mint: &str, amount_raw: u64) -> Result<f64> {
+        let jupiter_client = JupiterClient::new(self.app_state.rpc_nonblocking_client.clone());
+        
+        match jupiter_client.get_quote(token_mint, SOL_MINT, amount_raw, 100).await {
+            Ok(quote) => {
+                let sol_amount_raw = quote.out_amount.parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
+                Ok(sol_amount_raw as f64 / 1e9)
+            },
+            Err(_) => Ok(0.0) // Return 0 if we can't get a quote
+        }
+    }
+
+    /// Get token balance directly from RPC without caching
+    async fn get_token_balance_direct(&self, mint: &str, ata: &Pubkey) -> Result<(u64, f64, u8)> {
+        self.logger.log(format!("Fetching fresh balance for {} (account: {}) directly from RPC", mint, ata).yellow().to_string());
+        match self.app_state.rpc_nonblocking_client.get_token_account(ata).await {
+            Ok(Some(account)) => {
+                let amount_raw = account.token_amount.amount.parse::<u64>()
+                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?;
+                let decimal_amount = account.token_amount.amount.parse::<f64>()
+                    .map_err(|e| anyhow!("Failed to parse token amount: {}", e))?
+                    / 10f64.powi(account.token_amount.decimals as i32);
+                let decimals = account.token_amount.decimals;
+                
+                self.logger.log(format!("Fetched fresh balance for {}: {} tokens ({} raw units)", 
+                    mint, decimal_amount, amount_raw).green().to_string());
+                
+                Ok((amount_raw, decimal_amount, decimals))
+            },
+            Ok(None) => {
+                self.logger.log(format!("No token account found for mint: {}", mint).yellow().to_string());
+                Err(anyhow!("Token account not found"))
+            },
+            Err(e) => {
+                Err(anyhow!("Failed to get token account: {}", e))
+            }
+        }
     }
     
     /// Determine protocol from trade info
@@ -548,4 +747,59 @@ impl SimpleSellingEngine {
             _ => self.app_state.protocol_preference.clone(),
         }
     }
+}
+
+/// Trait for protocol-specific sell operations with cached balance for minimal latency
+trait ProtocolSellWithBalance {
+    fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> impl std::future::Future<Output = Result<(Arc<Keypair>, Vec<Instruction>, f64)>> + Send;
+}
+
+impl ProtocolSellWithBalance for Pump {
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data_with_balance(trade_info, swap_config, cached_balance).await
+    }
+}
+
+impl ProtocolSellWithBalance for PumpSwap {
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        self.build_swap_from_parsed_data_with_balance(trade_info, swap_config, cached_balance).await
+    }
+}
+
+impl ProtocolSellWithBalance for crate::dex::raydium_launchpad::Raydium {
+    async fn build_swap_from_parsed_data_with_balance(&self, trade_info: &TradeInfoFromToken, swap_config: SwapConfig, _cached_balance: Option<(u64, u8)>) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        // Raydium doesn't have the cached balance method, so fallback to standard method
+        // This may have slightly higher latency but still better than Jupiter fallback
+        self.build_swap_from_parsed_data(trade_info, swap_config).await
+    }
+} 
+
+/// Convenience function to create a SimpleSellingEngine and sell all tokens
+/// This can be used by external modules like main.rs for risk management
+pub async fn sell_all_wallet_tokens_with_jupiter(
+    app_state: Arc<AppState>,
+    swap_config: Arc<SwapConfig>,
+    transaction_landing_mode: crate::common::config::TransactionLandingMode,
+) -> Result<()> {
+    let selling_engine = SimpleSellingEngine::new(
+        app_state,
+        swap_config,
+        transaction_landing_mode,
+    );
+    
+    selling_engine.sell_all_tokens().await
+}
+
+/// Alternative convenience function that uses default settings
+pub async fn emergency_sell_all_tokens(app_state: Arc<AppState>) -> Result<()> {
+    let swap_config = Arc::new(SwapConfig {
+        swap_direction: SwapDirection::Sell,
+        in_type: SwapInType::Qty,
+        amount_in: 0.1, // Not used for selling
+        slippage: 100, // 1% slippage
+    });
+    
+    let transaction_landing_mode = crate::common::config::TransactionLandingMode::Zeroslot;
+    
+    sell_all_wallet_tokens_with_jupiter(app_state, swap_config, transaction_landing_mode).await
 } 
