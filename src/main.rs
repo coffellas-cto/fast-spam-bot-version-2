@@ -797,7 +797,7 @@ async fn execute_swap_transaction(
             attempts += 1;
             
             // Try to convert versioned transaction to legacy transaction for zeroslot compatibility
-            if let Ok(legacy_tx) = transaction.clone().into_legacy_transaction() {
+            if let Some(legacy_tx) = transaction.clone().into_legacy_transaction() {
                 // Send the legacy transaction using zeroslot for minimal latency
                 match config.app_state.zeroslot_rpc_client.send_transaction(&legacy_tx).await {
                     Ok(signature) => {
