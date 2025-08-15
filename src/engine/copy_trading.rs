@@ -191,6 +191,13 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
         }
     });
 
+    // Create parallel transaction processor (must be created before spawning monitoring tasks)
+    let parallel_processor = ParallelTransactionProcessor::new(
+        Arc::new(config.app_state.clone()),
+        Arc::new(config.swap_config.clone()),
+        config.transaction_landing_mode.clone(),
+    );
+
     // Spawn counter status logging task
     let logger_clone = logger.clone();
     let config_clone = config.clone();
@@ -233,13 +240,6 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
             eprintln!("Token monitoring service failed: {}", e);
         }
     });
-
-    // Create parallel transaction processor
-    let parallel_processor = ParallelTransactionProcessor::new(
-        Arc::new(config.app_state.clone()),
-        Arc::new(config.swap_config.clone()),
-        config.transaction_landing_mode.clone(),
-    );
 
     // Process incoming messages
     logger.log("Starting to process transactions...".green().to_string());

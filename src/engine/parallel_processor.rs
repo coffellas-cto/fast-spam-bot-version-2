@@ -264,7 +264,8 @@ impl ParallelTransactionProcessor {
         use anchor_client::solana_sdk::pubkey::Pubkey;
         use spl_associated_token_account::get_associated_token_address;
         
-        let wallet_pubkey = selling_engine.app_state().wallet.try_pubkey();
+        let wallet_pubkey = selling_engine.app_state().wallet.try_pubkey()
+            .map_err(|e| anyhow::anyhow!("Failed to get wallet pubkey: {}", e))?;
         
         let token_pubkey = Pubkey::from_str(&trade_info.mint)
             .map_err(|e| anyhow::anyhow!("Invalid token mint: {}", e))?;
