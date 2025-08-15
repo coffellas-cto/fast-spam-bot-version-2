@@ -3,6 +3,8 @@ use std::time::Duration;
 use anyhow::Result;
 use colored::Colorize;
 use tokio::time::{interval, Instant};
+use anchor_client::solana_sdk::signature::Signer;
+use solana_program_pack::Pack;
 
 use crate::common::{config::AppState, logger::Logger};
 use crate::engine::selling_strategy::emergency_sell_all_tokens;
@@ -149,8 +151,7 @@ impl BalanceMonitorService {
         use std::str::FromStr;
         use anchor_client::solana_sdk::pubkey::Pubkey;
         
-        let wallet_pubkey = app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow::anyhow!("Failed to get wallet pubkey: {}", e))?;
+        let wallet_pubkey = app_state.wallet.pubkey();
         
         // Get the token program pubkey
         let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
@@ -272,8 +273,7 @@ impl BalanceMonitorService {
         }
         
         // Get current SOL balance to check if we have enough to wrap
-        let wallet_pubkey = app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow::anyhow!("Failed to get wallet pubkey: {}", e))?;
+        let wallet_pubkey = app_state.wallet.pubkey();
         
         let sol_balance_lamports = app_state.rpc_client.get_balance(&wallet_pubkey)
             .map_err(|e| anyhow::anyhow!("Failed to get SOL balance: {}", e))?;
@@ -312,8 +312,7 @@ impl BalanceMonitorService {
         use anchor_client::solana_sdk::system_instruction;
         use spl_token::instruction::sync_native;
         
-        let wallet_pubkey = app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow::anyhow!("Failed to get wallet pubkey: {}", e))?;
+        let wallet_pubkey = app_state.wallet.pubkey();
         
         // Get WSOL mint and ATA
         let wsol_mint = Pubkey::from_str("So11111111111111111111111111111111111111112")?;

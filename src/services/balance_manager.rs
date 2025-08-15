@@ -305,7 +305,7 @@ impl BalanceManager {
             return Err(anyhow!("Insufficient WSOL balance: {} < {}", current_wsol, amount));
         }
 
-        let amount_raw = ui_amount_to_amount(amount, WSOL_DECIMALS);
+        let _amount_raw = ui_amount_to_amount(amount, WSOL_DECIMALS);
         let mut instructions = Vec::new();
 
         // Close the WSOL account (this unwraps WSOL back to SOL)

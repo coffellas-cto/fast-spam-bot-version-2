@@ -52,6 +52,11 @@ impl SimpleSellingEngine {
         }
     }
     
+    /// Get access to the app state
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.app_state
+    }
+    
     /// Execute a buy operation when target buys - simplified without tracking
     pub async fn execute_buy(&self, trade_info: &TradeInfoFromToken) -> Result<()> {
         self.logger.log(format!("Executing BUY for token: {}", trade_info.mint).green().to_string());

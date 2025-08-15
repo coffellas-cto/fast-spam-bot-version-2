@@ -264,8 +264,7 @@ impl ParallelTransactionProcessor {
         use anchor_client::solana_sdk::pubkey::Pubkey;
         use spl_associated_token_account::get_associated_token_address;
         
-        let wallet_pubkey = selling_engine.app_state.wallet.try_pubkey()
-            .map_err(|e| anyhow::anyhow!("Failed to get wallet pubkey: {}", e))?;
+        let wallet_pubkey = selling_engine.app_state().wallet.pubkey();
         
         let token_pubkey = Pubkey::from_str(&trade_info.mint)
             .map_err(|e| anyhow::anyhow!("Invalid token mint: {}", e))?;
@@ -273,7 +272,7 @@ impl ParallelTransactionProcessor {
         let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
         
         // Get token balance
-        match selling_engine.app_state.rpc_nonblocking_client.get_token_account(&ata).await {
+        match selling_engine.app_state().rpc_nonblocking_client.get_token_account(&ata).await {
             Ok(Some(account)) => {
                 let amount_raw = account.token_amount.amount.parse::<u64>()
                     .map_err(|e| anyhow::anyhow!("Failed to parse token amount: {}", e))?;
@@ -295,7 +294,7 @@ impl ParallelTransactionProcessor {
                         &trade_info.mint,
                         amount_raw,
                         100, // 1% slippage
-                        &selling_engine.app_state.wallet
+                        &selling_engine.app_state().wallet
                     ).await {
                         Ok(signature) => {
                             logger.log(format!("✅ Jupiter sell successful (attempt {}): {}", attempt, signature).green().bold().to_string());
