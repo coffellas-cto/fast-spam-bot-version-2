@@ -84,7 +84,7 @@ use solana_vntr_sniper::{
         copy_trading::{start_copy_trading, CopyTradingConfig},
         swap::SwapProtocol,
     },
-    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService, periodic_seller::PeriodicSellerService},
+    services::{cache_maintenance, blockhash_processor::BlockhashProcessor, risk_management::RiskManagementService, periodic_seller::PeriodicSellerService, balance_monitor::BalanceMonitorService},
     core::token,
 };
 use solana_program_pack::Pack;
@@ -1345,6 +1345,21 @@ async fn main() {
     });
     
     println!("Periodic selling service started (selling every 2 minutes)");
+    
+    // Create and start the balance monitoring service
+    let balance_monitor_service = BalanceMonitorService::new(
+        Arc::new(config.app_state.clone())
+    );
+    
+    // Start balance monitoring service in background
+    let balance_monitor_clone = balance_monitor_service.clone();
+    tokio::spawn(async move {
+        if let Err(e) = balance_monitor_clone.start_monitoring().await {
+            eprintln!("Balance monitoring error: {}", e);
+        }
+    });
+    
+    println!("Balance monitoring service started (checking every 2 minutes with must-selling)");
     
     // Start the copy trading bot
     if let Err(e) = start_copy_trading(copy_trading_config).await {
