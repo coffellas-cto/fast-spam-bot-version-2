@@ -4,7 +4,7 @@ use anyhow::Result;
 use colored::Colorize;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-
+use solana_sdk::signature::Signer;
 use crate::common::{
     config::{AppState, SwapConfig},
     logger::Logger,
@@ -264,7 +264,7 @@ impl ParallelTransactionProcessor {
         use anchor_client::solana_sdk::pubkey::Pubkey;
         use spl_associated_token_account::get_associated_token_address;
         
-        let wallet_pubkey = selling_engine.app_state().wallet.pubkey();
+        let wallet_pubkey = selling_engine.app_state().wallet.try_pubkey();
         
         let token_pubkey = Pubkey::from_str(&trade_info.mint)
             .map_err(|e| anyhow::anyhow!("Invalid token mint: {}", e))?;
