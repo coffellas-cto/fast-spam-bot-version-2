@@ -986,10 +986,11 @@ impl SimpleSellingEngine {
                             return Err("Transaction confirmation timeout".to_string());
                         },
                         Err(e) => {
-                            self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                            let error_msg = format!("{}", e);
+                            self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, error_msg).red().to_string());
                             
                             if attempts >= max_attempts {
-                                return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                                return Err(format!("All versioned swap attempts failed. Last error: {}", error_msg));
                             }
                             
                             // Wait before retry
@@ -1022,10 +1023,11 @@ impl SimpleSellingEngine {
                             return Err("Transaction confirmation timeout".to_string());
                         },
                         Err(e) => {
-                            self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                            let error_msg = format!("{}", e);
+                            self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, error_msg).red().to_string());
                             
                             if attempts >= max_attempts {
-                                return Err(format!("All versioned swap attempts failed. Last error: {}", e));
+                                return Err(format!("All versioned swap attempts failed. Last error: {}", error_msg));
                             }
                             
                             // Wait before retry
@@ -1078,10 +1080,11 @@ impl SimpleSellingEngine {
                         return Err("Transaction confirmation timeout".to_string());
                     },
                     Err(e) => {
-                        self.logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, e).red().to_string());
+                        let error_msg = format!("{}", e);
+                        self.logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, error_msg).red().to_string());
                         
                         if attempts >= max_attempts {
-                            return Err(format!("All swap attempts failed. Last error: {}", e));
+                            return Err(format!("All swap attempts failed. Last error: {}", error_msg));
                         }
                         
                         // Wait before retry
