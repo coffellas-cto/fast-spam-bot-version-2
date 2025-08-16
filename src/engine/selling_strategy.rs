@@ -6,6 +6,8 @@ use colored::Colorize;
 use spl_associated_token_account::get_associated_token_address;
 use spl_token;
 use solana_program_pack::Pack;
+use anchor_client::solana_sdk::transaction::{Transaction, VersionedTransaction};
+use anchor_client::solana_sdk::signature::Signer;
 use crate::common::{
     config::{AppState, SwapConfig},
     logger::Logger,
@@ -15,7 +17,6 @@ use crate::engine::swap::{SwapDirection, SwapProtocol, SwapInType};
 use crate::dex::pump_fun::Pump;
 use crate::dex::pump_swap::PumpSwap;
 use crate::services::{jupiter::JupiterClient, balance_manager::BalanceManager};
-use solana_sdk::signature::Signer;
 
 /// Token account information for bulk selling
 #[derive(Debug, Clone)]
