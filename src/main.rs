@@ -455,14 +455,14 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
             &[&wallet_pubkey],
         ).map_err(|e| format!("Failed to create close instruction for {}: {}", token_account, e))?;
         
-        // Send transaction using zeroslot for minimal latency
-        let recent_blockhash = match solana_vntr_sniper::services::blockhash_processor::BlockhashProcessor::get_latest_blockhash().await {
-            Some(hash) => hash,
-            None => return Err(format!("Failed to get recent blockhash for token account {}", token_account)),
+        // Send transaction using normal RPC for token account closing
+        let recent_blockhash = match config.app_state.rpc_client.get_latest_blockhash() {
+            Ok(hash) => hash,
+            Err(e) => return Err(format!("Failed to get recent blockhash for token account {}: {}", token_account, e)),
         };
         
-        match solana_vntr_sniper::core::tx::new_signed_and_send_zeroslot(
-            config.app_state.zeroslot_rpc_client.clone(),
+        match solana_vntr_sniper::core::tx::new_signed_and_send_normal(
+            config.app_state.rpc_nonblocking_client.clone(),
             recent_blockhash,
             &config.app_state.wallet,
             vec![close_instruction],
