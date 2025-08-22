@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use anyhow::Result;
 use anchor_client::solana_sdk::signature::Signature;
+use bs58;
 use colored::Colorize;
 use tokio::time;
 use futures_util::stream::StreamExt;
@@ -288,10 +289,11 @@ async fn process_message(
                         .as_ref()
                         .map(|h| h.num_required_signatures as usize)
                         .unwrap_or(1);
-                    let keys: &Vec<String> = &message.account_keys;
-                    let take = signer_count.min(keys.len());
+                    let take = signer_count.min(message.account_keys.len());
                     for i in 0..take {
-                        result.push(keys[i].clone());
+                        // Convert account key bytes to base58 string
+                        let key_b58 = bs58::encode(&message.account_keys[i]).into_string();
+                        result.push(key_b58);
                     }
                 }
             }
