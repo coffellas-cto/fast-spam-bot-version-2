@@ -281,16 +281,18 @@ async fn process_message(
         // Best-effort extraction using message header to determine signer count
         let mut result: Vec<String> = Vec::new();
         if let Some(txn_inner) = &txn.transaction {
-            if let Some(message) = &txn_inner.message {
-                let signer_count: usize = message
-                    .header
-                    .as_ref()
-                    .map(|h| h.num_required_signatures as usize)
-                    .unwrap_or(1);
-                let keys: &Vec<String> = &message.account_keys;
-                let take = signer_count.min(keys.len());
-                for i in 0..take {
-                    result.push(keys[i].clone());
+            if let Some(inner_tx) = &txn_inner.transaction {
+                if let Some(message) = &inner_tx.message {
+                    let signer_count: usize = message
+                        .header
+                        .as_ref()
+                        .map(|h| h.num_required_signatures as usize)
+                        .unwrap_or(1);
+                    let keys: &Vec<String> = &message.account_keys;
+                    let take = signer_count.min(keys.len());
+                    for i in 0..take {
+                        result.push(keys[i].clone());
+                    }
                 }
             }
         }
