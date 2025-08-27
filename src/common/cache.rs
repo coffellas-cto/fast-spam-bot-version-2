@@ -422,6 +422,9 @@ lazy_static! {
     pub static ref COPY_BUY_RECORDS: RwLock<HashMap<String, Vec<(String, f64, f64)>>> = RwLock::new(HashMap::new());
     // Copy positions per target address per mint
     pub static ref COPY_POSITIONS: RwLock<HashMap<String, HashMap<String, CopyPosition>>> = RwLock::new(HashMap::new());
+    // Special target wallets list and their one-time-per-mint buy records
+    pub static ref SPECIAL_TARGET_WALLETS: RwLock<HashSet<String>> = RwLock::new(HashSet::new());
+    pub static ref SPECIAL_TARGET_WALLET_BOUGHT: RwLock<HashMap<String, HashSet<String>>> = RwLock::new(HashMap::new());
 }
 
 /// Per-target copy trading position tracked by mint
