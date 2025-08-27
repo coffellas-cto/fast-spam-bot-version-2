@@ -15,8 +15,8 @@ use spl_token::ui_amount_to_amount;
 use solana_sdk::signature::Signer;
 use tokio::time::{Instant, sleep};
 use tokio::sync::Mutex;
-use once_cell::sync::Lazy;
-use reqwest::{Client, ClientBuilder};
+
+
 use base64;
 use bs58;
 use std::time::Duration;
@@ -47,18 +47,7 @@ fn get_unit_limit() -> u32 {
 }
 
 
-// Cache the FlashBlock API key
-static FLASHBLOCK_API_KEY: Lazy<String> = Lazy::new(|| {
-    std::env::var("FLASHBLOCK_API_KEY")
-        .ok()
-        .unwrap_or_else(|| "da07907679634859".to_string())
-});
 
-// Create a static HTTP client with optimized configuration for FlashBlock API
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-   let client = reqwest::Client::new();
-   client
-});
 
 pub async fn new_signed_and_send_zeroslot(
     zeroslot_rpc_client: Arc<crate::services::zeroslot::ZeroSlotClient>,

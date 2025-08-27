@@ -494,65 +494,7 @@ async fn close_all_token_accounts(config: &Config) -> Result<(), String> {
     }
 }
 
-/// Initialize target wallet token list by fetching all token accounts owned by the target wallet
-async fn initialize_target_wallet_token_list(config: &Config, target_addresses: &[String]) -> Result<(), String> {
-    let logger = solana_vntr_sniper::common::logger::Logger::new("[INIT-TARGET-TOKENS] => ".green().to_string());
-    
-    // Check if we should initialize
-    let should_check = std::env::var("IS_CHECK_TARGET_WALLET_TOKEN_ACCOUNT")
-        .ok()
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(false);
-        
-    if !should_check {
-        logger.log("Skipping target wallet token check as IS_CHECK_TARGET_WALLET_TOKEN_ACCOUNT is not true".to_string());
-        return Ok(());
-    }
-    
-    // Get the token program pubkey
-    let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    
-    for target_address in target_addresses {
-        // Parse target wallet address
-        let target_pubkey = match Pubkey::from_str(target_address) {
-            Ok(pk) => pk,
-            Err(e) => {
-                logger.log(format!("Invalid target address {}: {}", target_address, e).red().to_string());
-                continue;
-            }
-        };
-        
-        // Query all token accounts owned by the target wallet
-        match config.app_state.rpc_client.get_token_accounts_by_owner(
-            &target_pubkey,
-            anchor_client::solana_client::rpc_request::TokenAccountsFilter::ProgramId(token_program)
-        ) {
-            Ok(accounts) => {
-                logger.log(format!("Found {} token accounts for target {}", accounts.len(), target_address));
-                
-                // Add each token's mint to our global cache
-                for account in accounts {
-                    if let Ok(token_account) = config.app_state.rpc_client.get_account(&Pubkey::from_str(&account.pubkey).unwrap()) {
-                        if let Ok(parsed) = spl_token::state::Account::unpack(&token_account.data) {
-                            solana_vntr_sniper::common::cache::TARGET_WALLET_TOKENS.insert(parsed.mint.to_string());
-                            logger.log(format!("Added token mint {} to target wallet list", parsed.mint));
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                logger.log(format!("Error fetching token accounts for target {}: {}", target_address, e).red().to_string());
-            }
-        }
-    }
-    
-    logger.log(format!(
-        "Target wallet token list initialized with {} tokens",
-        solana_vntr_sniper::common::cache::TARGET_WALLET_TOKENS.size()
-    ));
-    
-    Ok(())
-}
+
 
 /// Get all token accounts for the wallet
 async fn get_wallet_token_accounts(config: &Config) -> Result<Vec<TokenAccount>, String> {
@@ -1285,11 +1227,7 @@ async fn main() {
         return;
     }
     
-    // Initialize target wallet token list
-    if let Err(e) = initialize_target_wallet_token_list(&config, &target_addresses).await {
-        eprintln!("Failed to initialize target wallet token list: {}", e);
-        return;
-    }
+
     
     // Get protocol preference from environment
     let protocol_preference = std::env::var("PROTOCOL_PREFERENCE")
