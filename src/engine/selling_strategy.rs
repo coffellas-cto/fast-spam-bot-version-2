@@ -6,6 +6,8 @@ use colored::Colorize;
 use spl_associated_token_account::get_associated_token_address;
 use spl_token;
 use solana_program_pack::Pack;
+use anchor_client::solana_sdk::transaction::{Transaction, VersionedTransaction};
+use anchor_client::solana_sdk::signature::Signer;
 use crate::common::{
     config::{AppState, SwapConfig},
     logger::Logger,
@@ -15,7 +17,6 @@ use crate::engine::swap::{SwapDirection, SwapProtocol, SwapInType};
 use crate::dex::pump_fun::Pump;
 use crate::dex::pump_swap::PumpSwap;
 use crate::services::{jupiter::JupiterClient, balance_manager::BalanceManager};
-use solana_sdk::signature::Signer;
 
 /// Token account information for bulk selling
 #[derive(Debug, Clone)]
@@ -29,6 +30,101 @@ pub struct WalletTokenInfo {
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const JUPITER_API_URL: &str = "https://quote-api.jup.ag";
+
+// Jupiter API structures (copied from main.rs for bulk selling)
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct JupiterQuoteResponse {
+    #[serde(rename = "inputMint")]
+    input_mint: String,
+    #[serde(rename = "inAmount")]
+    in_amount: String,
+    #[serde(rename = "outputMint")]
+    output_mint: String,
+    #[serde(rename = "outAmount")]
+    out_amount: String,
+    #[serde(rename = "otherAmountThreshold")]
+    other_amount_threshold: String,
+    #[serde(rename = "swapMode")]
+    swap_mode: String,
+    #[serde(rename = "slippageBps")]
+    slippage_bps: u16,
+    #[serde(rename = "platformFee")]
+    platform_fee: Option<PlatformFeeInfo>,
+    #[serde(rename = "priceImpactPct")]
+    price_impact_pct: Option<String>,
+    #[serde(rename = "routePlan")]
+    route_plan: Vec<RoutePlanEntry>,
+    #[serde(rename = "contextSlot")]
+    context_slot: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PlatformFeeInfo {
+    amount: String,
+    #[serde(rename = "feeBps")]
+    fee_bps: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RoutePlanEntry {
+    #[serde(rename = "swapInfo")]
+    swap_info: SwapInfoEntry,
+    percent: u8,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SwapInfoEntry {
+    label: String,
+    #[serde(rename = "ammKey")]
+    amm_key: String,
+    #[serde(rename = "inputMint")]
+    input_mint: String,
+    #[serde(rename = "outputMint")]
+    output_mint: String,
+    #[serde(rename = "inAmount")]
+    in_amount: String,
+    #[serde(rename = "outAmount")]
+    out_amount: String,
+    #[serde(rename = "feeAmount")]
+    fee_amount: String,
+    #[serde(rename = "feeMint")]
+    fee_mint: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PrioritizationFeeLamports {
+    #[serde(rename = "priorityLevelWithMaxLamports")]
+    priority_level_with_max_lamports: PriorityLevelWithMaxLamports,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PriorityLevelWithMaxLamports {
+    #[serde(rename = "maxLamports")]
+    max_lamports: u64,
+    #[serde(rename = "priorityLevel")]
+    priority_level: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct JupiterSwapRequest {
+    #[serde(rename = "quoteResponse")]
+    quote_response: JupiterQuoteResponse,
+    #[serde(rename = "userPublicKey")]
+    user_public_key: String,
+    #[serde(rename = "wrapAndUnwrapSol")]
+    wrap_and_unwrap_sol: bool,
+    #[serde(rename = "dynamicComputeUnitLimit")]
+    dynamic_compute_unit_limit: bool,
+    #[serde(rename = "prioritizationFeeLamports")]
+    prioritization_fee_lamports: PrioritizationFeeLamports,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct JupiterSwapResponse {
+    #[serde(rename = "swapTransaction")]
+    swap_transaction: String,
+}
 /// Simple selling engine for basic buy/sell operations
 #[derive(Clone)]
 pub struct SimpleSellingEngine {
@@ -50,6 +146,11 @@ impl SimpleSellingEngine {
             transaction_landing_mode,
             logger: Logger::new("[SIMPLE-SELLING] => ".yellow().to_string()),
         }
+    }
+    
+    /// Get access to the app state
+    pub fn app_state(&self) -> &Arc<AppState> {
+        &self.app_state
     }
     
     /// Execute a buy operation when target buys - simplified without tracking
@@ -659,49 +760,57 @@ impl SimpleSellingEngine {
         Ok(token_accounts)
     }
     
-    /// Sell a single token using Jupiter API
+    /// Sell a single token using Jupiter API (using the same working approach as main.rs --sell)
     async fn sell_single_token_jupiter(&self, token: &WalletTokenInfo) -> Result<String> {
         self.logger.log(format!("Selling token {} using Jupiter API (amount: {})", token.mint, token.amount_raw).magenta().to_string());
         
-        let jupiter_client = JupiterClient::new(self.app_state.rpc_nonblocking_client.clone());
-        
-        // Use 100 bps (1%) slippage for Jupiter
-        let slippage_bps = 100;
-        
-        // Get quote first to check if swap is viable
-        match jupiter_client.get_quote(&token.mint, SOL_MINT, token.amount_raw, slippage_bps).await {
-            Ok(quote) => {
-                // Parse expected output
-                let expected_sol_raw = quote.out_amount.parse::<u64>()
-                    .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
-                let expected_sol = expected_sol_raw as f64 / 1e9;
-                
-                // Check if expected output is worthwhile (more than 0.0001 SOL)
-                if expected_sol < 0.0001 {
-                    return Err(anyhow!("Expected SOL output too small: {} SOL", expected_sol));
-                }
-                
-                self.logger.log(format!("Expected SOL output for {}: {:.6}", token.mint, expected_sol).cyan().to_string());
-                
-                // Execute the sell
-                jupiter_client.sell_token_with_jupiter(
-                    &token.mint,
-                    token.amount_raw,
-                    slippage_bps,
-                    &self.app_state.wallet
-                ).await
-            },
-            Err(e) => {
-                Err(anyhow!("Failed to get Jupiter quote for {}: {}", token.mint, e))
-            }
+        // Skip SOL and WSOL
+        if token.mint == SOL_MINT || token.mint == WSOL_MINT {
+            self.logger.log("Skipping SOL/WSOL token".to_string());
+            return Ok("Skipped SOL/WSOL".to_string());
         }
+        
+        self.logger.log(format!("Selling {} {} (decimals: {})", token.amount, token.mint, token.decimals));
+        self.logger.log(format!("Amount in smallest unit: {}", token.amount_raw));
+        
+        // Get quote from Jupiter using the working main.rs functions
+        let quote = self.get_jupiter_quote(
+            &token.mint,
+            SOL_MINT,
+            token.amount_raw,
+            100, // 1% slippage
+        ).await.map_err(|e| anyhow!("Jupiter quote failed: {}", e))?;
+        
+        // Calculate expected SOL output
+        let expected_sol = quote.out_amount.parse::<u64>()
+            .map_err(|e| anyhow!("Failed to parse output amount: {}", e))? as f64 / 1e9;
+        
+        // Check if expected output is worthwhile (more than 0.0001 SOL)
+        if expected_sol < 0.0001 {
+            return Err(anyhow!("Expected SOL output too small: {} SOL", expected_sol));
+        }
+        
+        self.logger.log(format!("Expected SOL output: {}", expected_sol));
+        
+        // Get wallet pubkey
+        let wallet_pubkey = self.app_state.wallet.try_pubkey()
+            .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
+        
+        // Get swap transaction using the working main.rs functions
+        let swap_transaction = self.get_jupiter_swap_transaction(quote, &wallet_pubkey.to_string()).await
+            .map_err(|e| anyhow!("Get swap transaction failed: {}", e))?;
+        
+        // Execute the swap using the working main.rs functions
+        let signature = self.execute_swap_transaction(&swap_transaction).await
+            .map_err(|e| anyhow!("Execute swap transaction failed: {}", e))?;
+        
+        self.logger.log(format!("Token sold successfully! Signature: {}", signature));
+        Ok(signature)
     }
     
     /// Estimate SOL output for a token sale (for reporting purposes)
     async fn estimate_sol_output(&self, token_mint: &str, amount_raw: u64) -> Result<f64> {
-        let jupiter_client = JupiterClient::new(self.app_state.rpc_nonblocking_client.clone());
-        
-        match jupiter_client.get_quote(token_mint, SOL_MINT, amount_raw, 100).await {
+        match self.get_jupiter_quote(token_mint, SOL_MINT, amount_raw, 100).await {
             Ok(quote) => {
                 let sol_amount_raw = quote.out_amount.parse::<u64>()
                     .map_err(|e| anyhow!("Failed to parse output amount: {}", e))?;
@@ -709,6 +818,287 @@ impl SimpleSellingEngine {
             },
             Err(_) => Ok(0.0) // Return 0 if we can't get a quote
         }
+    }
+
+    /// Get Jupiter quote for token swap (copied from main.rs)
+    async fn get_jupiter_quote(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        slippage_bps: u16,
+    ) -> Result<JupiterQuoteResponse, String> {
+        self.logger.log(format!("Getting quote: {} -> {} (amount: {})", input_mint, output_mint, amount));
+        
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+            JUPITER_API_URL, input_mint, output_mint, amount, slippage_bps
+        );
+        
+        let response = client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get quote: {}", e))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("Quote API returned status: {} - {}", status, error_text));
+        }
+        
+        // Log the raw response for debugging
+        let response_text = response.text().await
+            .map_err(|e| format!("Failed to read response text: {}", e))?;
+        self.logger.log(format!("Raw quote response (first 500 chars): {}", 
+            &response_text[..std::cmp::min(500, response_text.len())]));
+        
+        let quote: JupiterQuoteResponse = serde_json::from_str(&response_text)
+            .map_err(|e| format!("Failed to parse quote response: {}. Response: {}", e, 
+                &response_text[..std::cmp::min(200, response_text.len())]))?;
+        
+        self.logger.log(format!("Quote received: {} {} -> {} {}", 
+                         quote.in_amount, input_mint, quote.out_amount, output_mint));
+        
+        Ok(quote)
+    }
+
+    /// Get Jupiter swap transaction (copied from main.rs)
+    async fn get_jupiter_swap_transaction(
+        &self,
+        quote: JupiterQuoteResponse,
+        user_public_key: &str,
+    ) -> Result<String, String> {
+        self.logger.log("Getting swap transaction from Jupiter".to_string());
+        
+        let client = reqwest::Client::new();
+        let url = "https://lite-api.jup.ag/swap/v1/swap";
+        
+        let swap_request = JupiterSwapRequest {
+            quote_response: quote,
+            user_public_key: user_public_key.to_string(),
+            wrap_and_unwrap_sol: true,
+            dynamic_compute_unit_limit: true,
+            prioritization_fee_lamports: PrioritizationFeeLamports {
+                priority_level_with_max_lamports: PriorityLevelWithMaxLamports {
+                    max_lamports: 1000000,
+                    priority_level: "high".to_string(),
+                },
+            },
+        };
+        
+        // Log the request for debugging
+        self.logger.log(format!("Sending swap request to: {}", url));
+        self.logger.log(format!("Request payload (first 300 chars): {}", 
+            serde_json::to_string(&swap_request)
+                .unwrap_or_else(|_| "Failed to serialize".to_string())
+                .chars().take(300).collect::<String>()));
+        
+        let response = client.post(url)
+            .json(&swap_request)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get swap transaction: {}", e))?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            self.logger.log(format!("Jupiter swap API error: Status {}, Response: {}", status, error_text));
+            return Err(format!("Swap API returned status: {} - {}", status, error_text));
+        }
+        
+        let swap_response: JupiterSwapResponse = response.json()
+            .await
+            .map_err(|e| format!("Failed to parse swap response: {}", e))?;
+        
+        self.logger.log("Swap transaction received from Jupiter".to_string());
+        Ok(swap_response.swap_transaction)
+    }
+
+    /// Execute Jupiter swap transaction (copied from main.rs)
+    async fn execute_swap_transaction(
+        &self,
+        swap_transaction_base64: &str,
+    ) -> Result<String, String> {
+        self.logger.log("Executing swap transaction".to_string());
+        
+        // Decode the base64 transaction
+        let transaction_bytes = base64::decode(swap_transaction_base64)
+            .map_err(|e| format!("Failed to decode transaction: {}", e))?;
+        
+        // Try to deserialize as versioned transaction first (Jupiter v6 primarily uses versioned transactions)
+        if let Ok(mut transaction) = bincode::deserialize::<VersionedTransaction>(&transaction_bytes) {
+            self.logger.log("Processing as versioned transaction".to_string());
+            
+            // Get recent blockhash
+            let recent_blockhash = self.app_state.rpc_client.get_latest_blockhash()
+                .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+            
+            // Update the transaction's blockhash
+            transaction.message.set_recent_blockhash(recent_blockhash);
+            
+            // Sign the versioned transaction
+            let message_data = transaction.message.serialize();
+            let signature = self.app_state.wallet.sign_message(&message_data);
+            
+            // Find the position of the keypair in the account keys to place the signature
+            let account_keys = transaction.message.static_account_keys();
+            if let Some(signer_index) = account_keys.iter().position(|key| *key == self.app_state.wallet.pubkey()) {
+                // Ensure we have enough signatures
+                if transaction.signatures.len() <= signer_index {
+                    transaction.signatures.resize(signer_index + 1, anchor_client::solana_sdk::signature::Signature::default());
+                }
+                transaction.signatures[signer_index] = signature;
+            } else {
+                return Err("Wallet not found in transaction account keys".to_string());
+            }
+            
+            // Send the transaction with retry logic
+            let mut attempts = 0;
+            let max_attempts = 3;
+            
+            while attempts < max_attempts {
+                attempts += 1;
+                
+                // Try to convert versioned transaction to legacy transaction for zeroslot compatibility
+                if let Some(legacy_tx) = transaction.clone().into_legacy_transaction() {
+                    // Send the legacy transaction using zeroslot for minimal latency
+                    match self.app_state.zeroslot_rpc_client.send_transaction(&legacy_tx).await {
+                        Ok(signature) => {
+                            self.logger.log(format!("Versioned swap transaction sent via zeroslot: {}", signature));
+                            
+                            // Wait for confirmation
+                            for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                
+                                if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
+                                    if let Some(result) = status {
+                                        if result.is_ok() {
+                                            self.logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                            return Ok(signature.to_string());
+                                        } else {
+                                            return Err(format!("Transaction failed: {:?}", result));
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            return Err("Transaction confirmation timeout".to_string());
+                        },
+                        Err(e) => {
+                            let error_msg = format!("{}", e);
+                            self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, error_msg).red().to_string());
+                            
+                            if attempts >= max_attempts {
+                                return Err(format!("All versioned swap attempts failed. Last error: {}", error_msg));
+                            }
+                            
+                            // Wait before retry
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                } else {
+                    // If conversion to legacy transaction fails, use normal RPC client as fallback
+                    self.logger.log("Cannot convert versioned transaction to legacy, using normal RPC".yellow().to_string());
+                    match self.app_state.rpc_client.send_transaction(&transaction) {
+                        Ok(signature) => {
+                            self.logger.log(format!("Versioned swap transaction sent via normal RPC: {}", signature));
+                            
+                            // Wait for confirmation
+                            for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                
+                                if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
+                                    if let Some(result) = status {
+                                        if result.is_ok() {
+                                            self.logger.log(format!("Versioned swap transaction confirmed: {}", signature));
+                                            return Ok(signature.to_string());
+                                        } else {
+                                            return Err(format!("Transaction failed: {:?}", result));
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            return Err("Transaction confirmation timeout".to_string());
+                        },
+                        Err(e) => {
+                            let error_msg = format!("{}", e);
+                            self.logger.log(format!("Versioned swap attempt {}/{} failed: {}", attempts, max_attempts, error_msg).red().to_string());
+                            
+                            if attempts >= max_attempts {
+                                return Err(format!("All versioned swap attempts failed. Last error: {}", error_msg));
+                            }
+                            
+                            // Wait before retry
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+        } else if let Ok(mut transaction) = bincode::deserialize::<Transaction>(&transaction_bytes) {
+            self.logger.log("Processing as legacy transaction".to_string());
+            
+            // Get recent blockhash
+            let recent_blockhash = self.app_state.rpc_client.get_latest_blockhash()
+                .map_err(|e| format!("Failed to get recent blockhash: {}", e))?;
+            
+            // Update the transaction's blockhash
+            transaction.message.recent_blockhash = recent_blockhash;
+            
+            // Sign the transaction
+            transaction.sign(&[&self.app_state.wallet], recent_blockhash);
+            
+            // Send the transaction with retry logic
+            let mut attempts = 0;
+            let max_attempts = 3;
+            
+            while attempts < max_attempts {
+                attempts += 1;
+                
+                // Send the transaction using zeroslot for minimal latency
+                match self.app_state.zeroslot_rpc_client.send_transaction(&transaction).await {
+                    Ok(signature) => {
+                        self.logger.log(format!("Swap transaction sent via zeroslot: {}", signature));
+                        
+                        // Wait for confirmation
+                        for _ in 0..30 { // Wait up to 30 seconds for confirmation
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            
+                            if let Ok(status) = self.app_state.rpc_client.get_signature_status(&signature) {
+                                if let Some(result) = status {
+                                    if result.is_ok() {
+                                        self.logger.log(format!("Swap transaction confirmed: {}", signature));
+                                        return Ok(signature.to_string());
+                                    } else {
+                                        return Err(format!("Transaction failed: {:?}", result));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return Err("Transaction confirmation timeout".to_string());
+                    },
+                    Err(e) => {
+                        let error_msg = format!("{}", e);
+                        self.logger.log(format!("Swap attempt {}/{} failed: {}", attempts, max_attempts, error_msg).red().to_string());
+                        
+                        if attempts >= max_attempts {
+                            return Err(format!("All swap attempts failed. Last error: {}", error_msg));
+                        }
+                        
+                        // Wait before retry
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        } else {
+            // If Jupiter returns neither transaction format, return an error
+            self.logger.log("Transaction format not supported - unable to deserialize as legacy or versioned transaction".yellow().to_string());
+            return Err("Unsupported transaction format - unable to deserialize as legacy or versioned transaction".to_string());
+        }
+        
+        Err("Maximum retry attempts exceeded".to_string())
     }
 
     /// Get token balance directly from RPC without caching

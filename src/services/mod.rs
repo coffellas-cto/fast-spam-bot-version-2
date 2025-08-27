@@ -1,4 +1,5 @@
 pub mod balance_manager;
+pub mod balance_monitor;
 pub mod blockhash_processor;
 pub mod cache_maintenance;
 pub mod jupiter;

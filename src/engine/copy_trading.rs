@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use anyhow::Result;
 use anchor_client::solana_sdk::signature::Signature;
+use bs58;
 use colored::Colorize;
 use tokio::time;
 use futures_util::stream::StreamExt;
@@ -10,7 +11,7 @@ use futures_util::{SinkExt, Sink};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestPing,
-    SubscribeRequestFilterTransactions,  SubscribeUpdate,
+    SubscribeRequestFilterTransactions,  SubscribeUpdate, SubscribeUpdateTransaction,
 };
 use crate::engine::transaction_parser;
 use crate::common::{
@@ -18,7 +19,7 @@ use crate::common::{
     logger::Logger,
 };
 use crate::engine::swap::SwapProtocol;
-use crate::engine::selling_strategy::SimpleSellingEngine;
+use crate::engine::parallel_processor::ParallelTransactionProcessor;
 use crate::services::token_monitor::TokenMonitor;
 use dashmap::DashMap;
 
@@ -191,6 +192,13 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
         }
     });
 
+    // Create parallel transaction processor (must be created before spawning monitoring tasks)
+    let parallel_processor = ParallelTransactionProcessor::new(
+        Arc::new(config.app_state.clone()),
+        Arc::new(config.swap_config.clone()),
+        config.transaction_landing_mode.clone(),
+    );
+
     // Spawn counter status logging task
     let logger_clone = logger.clone();
     let config_clone = config.clone();
@@ -198,6 +206,30 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
         loop {
             time::sleep(Duration::from_secs(60)).await;
             log_trading_stats(&logger_clone); // Changed to log_trading_stats
+        }
+    });
+
+    // Spawn parallel processor results monitoring task
+    let logger_results = logger.clone();
+    let parallel_processor_clone = parallel_processor.clone();
+    tokio::spawn(async move {
+        loop {
+            time::sleep(Duration::from_secs(10)).await; // Check every 10 seconds
+            
+            let completed_operations = parallel_processor_clone.check_completed_operations().await;
+            for result in completed_operations {
+                if result.success {
+                    logger_results.log(format!(
+                        "🎉 Parallel operation completed successfully: {:?} in {:?} - Signature: {:?}",
+                        result.operation, result.processing_time, result.signature
+                    ).green().bold().to_string());
+                } else {
+                    logger_results.log(format!(
+                        "⚠️ Parallel operation failed: {:?} in {:?} - Error: {:?}",
+                        result.operation, result.processing_time, result.error
+                    ).red().to_string());
+                }
+            }
         }
     });
 
@@ -210,19 +242,12 @@ pub async fn start_copy_trading(config: CopyTradingConfig) -> Result<(), String>
         }
     });
 
-    // Create simple selling engine
-    let selling_engine = SimpleSellingEngine::new(
-        Arc::new(config.app_state.clone()),
-        Arc::new(config.swap_config.clone()),
-        config.transaction_landing_mode.clone(),
-    );
-
     // Process incoming messages
     logger.log("Starting to process transactions...".green().to_string());
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(msg) => {
-                if let Err(e) = process_message(&msg, config.clone(), &logger, &selling_engine).await {
+                if let Err(e) = process_message(&msg, config.clone(), &logger, &parallel_processor).await {
                     logger.log(format!("Error processing message: {}", e).red().to_string());
                 }
             },
@@ -241,7 +266,7 @@ async fn process_message(
     msg: &SubscribeUpdate,
     config: Arc<CopyTradingConfig>,
     logger: &Logger,
-    selling_engine: &SimpleSellingEngine,
+    parallel_processor: &ParallelTransactionProcessor,
 ) -> Result<(), String> {
     let start_time = Instant::now();
     
@@ -252,6 +277,30 @@ async fn process_message(
     
     let mut target_signature = None;
     
+    // Helper: extract signer pubkeys from a Yellowstone transaction
+    fn extract_signers_from_txn(txn: &SubscribeUpdateTransaction) -> Vec<String> {
+        // Best-effort extraction using message header to determine signer count
+        let mut result: Vec<String> = Vec::new();
+        if let Some(txn_inner) = &txn.transaction {
+            if let Some(inner_tx) = &txn_inner.transaction {
+                if let Some(message) = &inner_tx.message {
+                    let signer_count: usize = message
+                        .header
+                        .as_ref()
+                        .map(|h| h.num_required_signatures as usize)
+                        .unwrap_or(1);
+                    let take = signer_count.min(message.account_keys.len());
+                    for i in 0..take {
+                        // Convert account key bytes to base58 string
+                        let key_b58 = bs58::encode(&message.account_keys[i]).into_string();
+                        result.push(key_b58);
+                    }
+                }
+            }
+        }
+        result
+    }
+
     // Handle transaction messages
     if let Some(UpdateOneof::Transaction(txn)) = &msg.update_oneof {
         // Extract transaction logs and account keys
@@ -274,6 +323,8 @@ async fn process_message(
         };
         
         if !inner_instructions.is_empty() {
+            // Compute signers (fee payer and any other signers)
+            let signers: Vec<String> = extract_signers_from_txn(txn);
             // Find inner instruction with data length of 368, 270, 266, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
                 .iter()
@@ -285,11 +336,12 @@ async fn process_message(
                 let config = config.clone();
                 let logger = logger.clone();
                 let txn = txn.clone();
-                let selling_engine = selling_engine.clone();
+                let parallel_processor = parallel_processor.clone();
+                let signers_clone = signers.clone();
                 
                 tokio::spawn(async move {
                     if let Some(parsed_data) = crate::engine::transaction_parser::parse_transaction_data(&txn, &data) {
-                        let _ = handle_parsed_data(parsed_data, config, target_signature, &logger, &selling_engine).await;
+                        let _ = handle_parsed_data(parsed_data, config, target_signature, &logger, &parallel_processor, signers_clone).await;
                     }
                 });
             }
@@ -306,7 +358,8 @@ async fn handle_parsed_data(
     config: Arc<CopyTradingConfig>,
     target_signature: Option<Signature>,
     logger: &Logger,
-    selling_engine: &SimpleSellingEngine,
+    parallel_processor: &ParallelTransactionProcessor,
+    signers: Vec<String>,
 ) -> Result<(), String> {
     let start_time = Instant::now();
     let instruction_type = parsed_data.dex_type.clone();
@@ -352,45 +405,49 @@ async fn handle_parsed_data(
             return Ok(());
         }
         
-        // Execute buy
-        logger.log(format!("Proceeding with BUY for token: {}", mint).cyan().to_string());
+        // Submit buy operation to parallel processor (non-blocking)
+        logger.log(format!("🚀 Submitting BUY operation to parallel processor for token: {}", mint).cyan().to_string());
         
-        match selling_engine.execute_buy(&parsed_data).await {
+        match parallel_processor.submit_buy_operation(parsed_data.clone()) {
             Ok(_) => {
-                logger.log(format!("Successfully executed BUY for token: {}", mint).green().to_string());
+                logger.log(format!("✅ BUY operation submitted successfully for token: {}", mint).green().to_string());
                 
-                // Update bought counter
-                if let Some(mut counter) = BOUGHT_COUNT.get_mut(&()) { // Changed to BOUGHT_COUNT
+                // Update bought counter (optimistic - the actual execution happens in background)
+                if let Some(mut counter) = BOUGHT_COUNT.get_mut(&()) {
                     *counter += 1;
                 }
                 LAST_BUY_TIME.insert((), Some(Instant::now()));
-                
             },
             Err(e) => {
-                logger.log(format!("Failed to execute BUY for token {}: {}", mint, e).red().to_string());
-                
-                return Err(format!("Failed to execute buy: {}", e));
+                logger.log(format!("❌ Failed to submit BUY operation for token {}: {}", mint, e).red().to_string());
+                return Err(format!("Failed to submit buy operation: {}", e));
             }
         }
     } else {
-        // Target is selling - we should sell too
-        logger.log(format!("Target is SELLING token: {}", mint).red().to_string());
+        // For sells, require that a signer matches one of the configured target addresses
+        let signer_is_target = !signers.is_empty() && signers.iter().any(|s| config.target_addresses.iter().any(|t| t == s));
+        if !signer_is_target {
+            logger.log(format!(
+                "Skipping SELL for {}: signer(s) {:?} do not match target addresses",
+                mint, signers
+            ).yellow().to_string());
+            return Ok(());
+        }
+        // Submit sell operation to parallel processor (non-blocking with must-selling)
+        logger.log(format!("🚀 Submitting SELL operation to parallel processor for token: {}", mint).red().to_string());
         
-        // Execute sell
-        match selling_engine.execute_sell(&parsed_data).await {
+        match parallel_processor.submit_sell_operation(parsed_data.clone()) {
             Ok(_) => {
-                logger.log(format!("Successfully executed SELL for token: {}", mint).green().to_string());
+                logger.log(format!("✅ SELL operation submitted successfully for token: {}", mint).green().to_string());
                 
-                // Update sold counter
-                if let Some(mut counter) = SOLD_COUNT.get_mut(&()) { // Changed to SOLD_COUNT
+                // Update sold counter (optimistic - the actual execution happens in background with retries)
+                if let Some(mut counter) = SOLD_COUNT.get_mut(&()) {
                     *counter += 1;
                 }
-                
             },
             Err(e) => {
-                logger.log(format!("Failed to execute SELL for token {}: {}", mint, e).red().to_string());
-                
-                return Err(format!("Failed to execute sell: {}", e));
+                logger.log(format!("❌ Failed to submit SELL operation for token {}: {}", mint, e).red().to_string());
+                return Err(format!("Failed to submit sell operation: {}", e));
             }
         }
     }

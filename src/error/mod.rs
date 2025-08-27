@@ -47,7 +47,7 @@ pub enum ClientError {
     /// Error from Solana RPC client
     SolanaClientError(anchor_client::solana_client::client_error::ClientError),
     /// Error uploading metadata
-    UploadMetadataError(Box<dyn std::error::Error>),
+    UploadMetadataError(Box<dyn std::error::Error + Send + Sync>),
     /// Invalid input parameters
     InvalidInput(&'static str),
     /// Insufficient funds for transaction
