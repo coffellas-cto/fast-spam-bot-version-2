@@ -92,11 +92,8 @@ impl Config {
             let wallet_cloned = wallet.clone();
             let swap_direction = SwapDirection::Buy; //SwapDirection::Sell
             let in_type = SwapInType::Qty; //SwapInType::Pct
-            let amount_in = import_env_var_with_default("TOKEN_AMOUNT", "0.001")
-                .parse::<f64>()
-                .unwrap_or(0.001_f64); //quantity
-                                        // let in_type = "pct"; //percentage
-                                        // let amount_in = 0.5; //percentage
+            // Static TOKEN_AMOUNT removed; dynamic buy amounts come from COPY_RATE
+            let amount_in = 0.0_f64;
 
             let swap_config = SwapConfig {
                 swap_direction,
@@ -116,13 +113,12 @@ impl Config {
                     format!(
                     "[SNIPER ENVIRONMENT]: \n\t\t\t\t [Yellowstone gRpc]: {},
                     \n\t\t\t\t * [Wallet]: {:?}, * [Balance]: {} Sol, 
-                    \n\t\t\t\t * [Slippage]: {}, * [Solana]: {}, * [Amount]: {}",
+                    \n\t\t\t\t * [Slippage]: {}, * [Solana]: {}",
                     yellowstone_grpc_http,
                     wallet_cloned.pubkey(),
                     balance as f64 / 1_000_000_000_f64,
                     slippage_input,
                     solana_price,
-                    amount_in,
                 )
                 .purple()
                 .italic()

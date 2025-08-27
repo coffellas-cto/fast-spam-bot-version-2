@@ -170,8 +170,12 @@ impl SimpleSellingEngine {
                 if val > 0.0 { dynamic_amount = Some(val); }
             }
         }
-        let configured_amount = buy_config.amount_in; // TOKEN_AMOUNT default
-        let chosen_amount = dynamic_amount.unwrap_or(configured_amount);
+        let configured_amount = buy_config.amount_in; // now 0.0 by config
+        let chosen_amount = dynamic_amount.unwrap_or(0.0);
+        if chosen_amount <= 0.0 {
+            self.logger.log("No dynamic buy amount available (COPY_RATE), skipping buy".yellow().to_string());
+            return Ok(());
+        }
         const MAX_BUY_AMOUNT: f64 = 1.0; // 1 SOL max buy amount
         let limited_amount = chosen_amount.min(MAX_BUY_AMOUNT);
         if limited_amount != chosen_amount {
