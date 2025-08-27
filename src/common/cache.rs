@@ -412,4 +412,42 @@ lazy_static! {
     pub static ref TARGET_WALLET_TOKENS: TargetWalletTokens = TargetWalletTokens::new();
     pub static ref BOUGHT_TOKENS: BoughtTokensTracker = BoughtTokensTracker::new();
     pub static ref TOKEN_BALANCE_CACHE: TokenBalanceCache = TokenBalanceCache::new(300); // 5 minutes TTL
-} 
+    // Per-address copy trading rate configuration (percent, e.g., 10 means 10%)
+    pub static ref PER_ADDRESS_COPY_RATE: RwLock<HashMap<String, f64>> = RwLock::new(HashMap::new());
+    // Upcoming dynamic buy SOL amounts per mint (accumulated across multiple targets)
+    pub static ref UPCOMING_BUY_SOL: RwLock<HashMap<String, f64>> = RwLock::new(HashMap::new());
+    // Upcoming dynamic sell token amounts (UI units) per mint (accumulated)
+    pub static ref UPCOMING_SELL_TOKENS: RwLock<HashMap<String, f64>> = RwLock::new(HashMap::new());
+    // Optional records of buy events: mint -> list of (target_address, target_buy_amount, bot_buy_amount)
+    pub static ref COPY_BUY_RECORDS: RwLock<HashMap<String, Vec<(String, f64, f64)>>> = RwLock::new(HashMap::new());
+    // Copy positions per target address per mint
+    pub static ref COPY_POSITIONS: RwLock<HashMap<String, HashMap<String, CopyPosition>>> = RwLock::new(HashMap::new());
+}
+
+/// Per-target copy trading position tracked by mint
+#[derive(Clone, Debug, Default)]
+pub struct CopyPosition {
+    /// Remaining tokens that the target effectively holds from tracked buys (decremented on sells)
+    pub target_remaining_tokens: f64,
+    /// Our remaining tokens bought in proportion to target (decremented on our sells)
+    pub bot_remaining_tokens: f64,
+}
+
+impl CopyPosition {
+    pub fn add_buy(&mut self, target_token_qty: f64, bot_token_qty: f64) {
+        self.target_remaining_tokens += target_token_qty;
+        self.bot_remaining_tokens += bot_token_qty;
+    }
+
+    /// Apply a target sell and compute proportional bot sell amount
+    pub fn apply_target_sell_and_compute_bot_sell(&mut self, target_sell_qty: f64) -> f64 {
+        if self.target_remaining_tokens <= 0.0 || self.bot_remaining_tokens <= 0.0 {
+            return 0.0;
+        }
+        let ratio = (target_sell_qty / self.target_remaining_tokens).clamp(0.0, 1.0);
+        let bot_sell = self.bot_remaining_tokens * ratio;
+        self.target_remaining_tokens = (self.target_remaining_tokens - target_sell_qty).max(0.0);
+        self.bot_remaining_tokens = (self.bot_remaining_tokens - bot_sell).max(0.0);
+        bot_sell
+    }
+}

@@ -1301,6 +1301,30 @@ async fn main() {
         })
         .unwrap_or(SwapProtocol::Auto);
     
+    // Load COPY_RATE default and per-address overrides
+    let default_copy_rate: f64 = std::env::var("COPY_RATE").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(10.0);
+    // Optional: COPY_RATE_MAP formatted as "addr1:10,addr2:30"
+    let copy_rate_map_env = std::env::var("COPY_RATE_MAP").ok();
+    {
+        use crate::common::cache::PER_ADDRESS_COPY_RATE;
+        let mut map = PER_ADDRESS_COPY_RATE.write().unwrap();
+        // initialize defaults
+        for addr in &target_addresses {
+            map.insert(addr.clone(), default_copy_rate);
+        }
+        if let Some(map_str) = copy_rate_map_env {
+            for pair in map_str.split(',') {
+                let pair = pair.trim();
+                if pair.is_empty() { continue; }
+                if let Some((addr, rate_str)) = pair.split_once(':') {
+                    if let Ok(rate) = rate_str.trim().parse::<f64>() {
+                        map.insert(addr.trim().to_string(), rate);
+                    }
+                }
+            }
+        }
+    }
+
     // Create copy trading config
     let copy_trading_config = CopyTradingConfig {
         yellowstone_grpc_http: config.yellowstone_grpc_http.clone(),

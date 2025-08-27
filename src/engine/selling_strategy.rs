@@ -17,6 +17,7 @@ use crate::engine::swap::{SwapDirection, SwapProtocol, SwapInType};
 use crate::dex::pump_fun::Pump;
 use crate::dex::pump_swap::PumpSwap;
 use crate::services::{jupiter::JupiterClient, balance_manager::BalanceManager};
+use crate::common::cache::{UPCOMING_BUY_SOL, UPCOMING_SELL_TOKENS};
 
 /// Token account information for bulk selling
 #[derive(Debug, Clone)]
@@ -157,23 +158,27 @@ impl SimpleSellingEngine {
     pub async fn execute_buy(&self, trade_info: &TradeInfoFromToken) -> Result<()> {
         self.logger.log(format!("Executing BUY for token: {}", trade_info.mint).green().to_string());
         
-        // Create buy config with amount limiting
+        // Create buy config with dynamic amount from queue if available
         let mut buy_config = (*self.swap_config).clone();
         buy_config.swap_direction = SwapDirection::Buy;
-        
-        // Define max buy amount to prevent BuyMoreBaseAmountThanPoolReserves errors
-        const MAX_BUY_AMOUNT: f64 = 1.0; // 1 SOL max buy amount
-        
-        // Use configured TOKEN_AMOUNT from .env file and apply safety limit
-        let configured_amount = buy_config.amount_in; // This contains TOKEN_AMOUNT from .env
-        let limited_amount = configured_amount.min(MAX_BUY_AMOUNT);
-        
-        if limited_amount != configured_amount {
-            self.logger.log(format!("Limited buy amount from {} to {} SOL (max_buy_amount)", 
-                configured_amount, limited_amount).yellow().to_string());
+
+        // Pull dynamic SOL amount if queued for this mint, else fall back to TOKEN_AMOUNT
+        let mut dynamic_amount = None;
+        {
+            let mut queued = UPCOMING_BUY_SOL.write().unwrap();
+            if let Some(val) = queued.remove(&trade_info.mint) {
+                if val > 0.0 { dynamic_amount = Some(val); }
+            }
         }
-        
-        self.logger.log(format!("Using buy amount: {} SOL (from TOKEN_AMOUNT config)", limited_amount).green().to_string());
+        let configured_amount = buy_config.amount_in; // TOKEN_AMOUNT default
+        let chosen_amount = dynamic_amount.unwrap_or(configured_amount);
+        const MAX_BUY_AMOUNT: f64 = 1.0; // 1 SOL max buy amount
+        let limited_amount = chosen_amount.min(MAX_BUY_AMOUNT);
+        if limited_amount != chosen_amount {
+            self.logger.log(format!("Limited buy amount from {} to {} SOL (max_buy_amount)", 
+                chosen_amount, limited_amount).yellow().to_string());
+        }
+        self.logger.log(format!("Using buy amount: {} SOL (dynamic_or_config)", limited_amount).green().to_string());
         buy_config.amount_in = limited_amount;
 
         // Execute buy based on protocol
@@ -382,7 +387,62 @@ impl SimpleSellingEngine {
     pub async fn execute_sell(&self, trade_info: &TradeInfoFromToken) -> Result<()> {
         self.logger.log(format!("Executing SELL for token: {}", trade_info.mint).red().to_string());
         
-        // Always attempt to sell using Jupiter as primary method since we're not tracking ownership
+        // Attempt proportional sell based on queued amount if present; fall back to Jupiter/all
+        // Check queued sell amount (UI units) for this mint
+        let queued_sell_tokens = {
+            let mut queued = UPCOMING_SELL_TOKENS.write().unwrap();
+            if let Some(val) = queued.remove(&trade_info.mint) { Some(val) } else { None }
+        };
+
+        if let Some(token_amount_ui) = queued_sell_tokens {
+            if token_amount_ui > 0.0 {
+                self.logger.log(format!("Proportional sell requested for {} tokens (mint {})", token_amount_ui, trade_info.mint).magenta().to_string());
+
+                // Convert UI amount to raw using on-chain decimals
+                let wallet_pubkey = self.app_state.wallet.try_pubkey()
+                    .map_err(|e| anyhow!("Failed to get wallet pubkey: {}", e))?;
+                let token_pubkey = Pubkey::from_str(&trade_info.mint)
+                    .map_err(|e| anyhow!("Invalid token mint address: {}", e))?;
+                let ata = get_associated_token_address(&wallet_pubkey, &token_pubkey);
+                match self.get_token_balance_direct(&trade_info.mint, &ata).await {
+                    Ok((_raw, _ui, decimals)) => {
+                        let amount_raw = (token_amount_ui * 10f64.powi(decimals as i32)).floor() as u64;
+                        if amount_raw == 0 {
+                            self.logger.log("Computed raw amount is zero, skipping proportional sell".yellow().to_string());
+                            return Ok(());
+                        }
+                        // Prefer Jupiter direct sell for precise amounts
+                        match self.execute_jupiter_sell(&trade_info.mint, amount_raw, decimals).await {
+                            Ok(signature) => {
+                                self.logger.log(format!("Proportional Jupiter sell successful: {}", signature).green().to_string());
+                                return Ok(());
+                            },
+                            Err(jupiter_error) => {
+                                self.logger.log(format!("Proportional Jupiter sell failed: {}. Falling back to native.", jupiter_error).red().to_string());
+                                // Fallback to native protocols using UI amount
+                                let mut sell_config = (*self.swap_config).clone();
+                                sell_config.swap_direction = SwapDirection::Sell;
+                                sell_config.amount_in = token_amount_ui;
+                                match self.execute_sell_with_retries(trade_info, sell_config, (amount_raw, decimals)).await {
+                                    Ok(signature) => {
+                                        self.logger.log(format!("Native proportional sell successful: {}", signature).green().to_string());
+                                        return Ok(());
+                                    },
+                                    Err(native_error) => {
+                                        return Err(anyhow!("Proportional sell failed. Jupiter: {}, Native: {}", jupiter_error, native_error));
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        self.logger.log(format!("Failed to fetch decimals for proportional sell: {}", e).yellow().to_string());
+                        // fall through to generic path
+                    }
+                }
+            }
+        }
+
         self.logger.log("Attempting Jupiter sell for target token...".magenta().to_string());
         
         // Get wallet pubkey

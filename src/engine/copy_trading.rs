@@ -22,6 +22,8 @@ use crate::engine::swap::SwapProtocol;
 use crate::engine::parallel_processor::ParallelTransactionProcessor;
 use crate::services::token_monitor::TokenMonitor;
 use dashmap::DashMap;
+use crate::common::cache::{PER_ADDRESS_COPY_RATE, COPY_POSITIONS, UPCOMING_BUY_SOL, UPCOMING_SELL_TOKENS, CopyPosition};
+use std::collections::HashMap;
 
 // Global state for copy trading - simplified to only track statistics
 lazy_static::lazy_static! {
@@ -405,8 +407,49 @@ async fn handle_parsed_data(
             return Ok(());
         }
         
+        // Determine which target address triggered this trade (first matching signer)
+        let maybe_target = signers.iter().find(|s| config.target_addresses.iter().any(|t| t == *s)).cloned();
+        if maybe_target.is_none() {
+            logger.log(format!("No matching target signer found for BUY {}, signers: {:?}", mint, signers).yellow().to_string());
+            return Ok(());
+        }
+        let target_addr = maybe_target.unwrap();
+
+        // Compute target amounts and our copy amounts
+        let target_sol = parsed_data.sol_change.abs();
+        let target_tokens = parsed_data.token_change.abs();
+        // Fetch copy rate percent for this address
+        let copy_rate_percent = {
+            let map = PER_ADDRESS_COPY_RATE.read().unwrap();
+            *map.get(&target_addr).unwrap_or(&10.0)
+        };
+        let bot_buy_sol = target_sol * (copy_rate_percent / 100.0);
+        let bot_buy_tokens = target_tokens * (copy_rate_percent / 100.0);
+
+        // Record per-address positions in cache
+        {
+            let mut positions = COPY_POSITIONS.write().unwrap();
+            let entry = positions.entry(target_addr.clone()).or_insert_with(HashMap::new);
+            let mint_entry = entry.entry(mint.clone()).or_insert_with(CopyPosition::default);
+            mint_entry.add_buy(target_tokens, bot_buy_tokens);
+        }
+
+        // Queue dynamic buy SOL amount for this mint (consumed by selling engine)
+        {
+            let mut buys = UPCOMING_BUY_SOL.write().unwrap();
+            let val = buys.entry(mint.clone()).or_insert(0.0);
+            *val += bot_buy_sol;
+        }
+
+        // Record hashmap (target_address, target_buy_amount, bot_buy_amount)
+        {
+            let mut records = crate::common::cache::COPY_BUY_RECORDS.write().unwrap();
+            let list = records.entry(mint.clone()).or_insert_with(Vec::new);
+            list.push((target_addr.clone(), target_sol, bot_buy_sol));
+        }
+
         // Submit buy operation to parallel processor (non-blocking)
-        logger.log(format!("🚀 Submitting BUY operation to parallel processor for token: {}", mint).cyan().to_string());
+        logger.log(format!("🚀 Submitting BUY operation to parallel processor for token: {} (copy_rate: {}%, bot_buy_sol: {:.9})", mint, copy_rate_percent, bot_buy_sol).cyan().to_string());
         
         match parallel_processor.submit_buy_operation(parsed_data.clone()) {
             Ok(_) => {
@@ -425,14 +468,37 @@ async fn handle_parsed_data(
         }
     } else {
         // For sells, require that a signer matches one of the configured target addresses
-        let signer_is_target = !signers.is_empty() && signers.iter().any(|s| config.target_addresses.iter().any(|t| t == s));
-        if !signer_is_target {
+        let maybe_target = signers.iter().find(|s| config.target_addresses.iter().any(|t| t == *s)).cloned();
+        if maybe_target.is_none() {
             logger.log(format!(
                 "Skipping SELL for {}: signer(s) {:?} do not match target addresses",
                 mint, signers
             ).yellow().to_string());
             return Ok(());
         }
+        let target_addr = maybe_target.unwrap();
+
+        // Compute proportional bot sell tokens based on tracked positions
+        let target_sell_tokens = parsed_data.token_change.abs();
+        let bot_sell_tokens = {
+            let mut positions = COPY_POSITIONS.write().unwrap();
+            if let Some(mints) = positions.get_mut(&target_addr) {
+                if let Some(pos) = mints.get_mut(&mint) {
+                    pos.apply_target_sell_and_compute_bot_sell(target_sell_tokens)
+                } else { 0.0 }
+            } else { 0.0 }
+        };
+
+        if bot_sell_tokens > 0.0 {
+            // Queue dynamic sell token amount for this mint (consumed by selling engine)
+            let mut sells = UPCOMING_SELL_TOKENS.write().unwrap();
+            let val = sells.entry(mint.clone()).or_insert(0.0);
+            *val += bot_sell_tokens;
+            logger.log(format!("Proportional SELL queued for {} tokens on mint {}", bot_sell_tokens, mint).red().to_string());
+        } else {
+            logger.log(format!("No proportional sell computed for mint {} (no position)", mint).yellow().to_string());
+        }
+
         // Submit sell operation to parallel processor (non-blocking with must-selling)
         logger.log(format!("🚀 Submitting SELL operation to parallel processor for token: {}", mint).red().to_string());
         
