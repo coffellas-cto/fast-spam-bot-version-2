@@ -22,8 +22,8 @@ use crate::engine::swap::SwapProtocol;
 use crate::engine::parallel_processor::ParallelTransactionProcessor;
 use crate::services::token_monitor::TokenMonitor;
 use dashmap::DashMap;
-use crate::common::cache::{PER_ADDRESS_COPY_RATE, COPY_POSITIONS, UPCOMING_BUY_SOL, UPCOMING_SELL_TOKENS, CopyPosition};
-use std::collections::HashMap;
+use crate::common::cache::{PER_ADDRESS_COPY_RATE, COPY_POSITIONS, UPCOMING_BUY_SOL, UPCOMING_SELL_TOKENS, CopyPosition, SPECIAL_TARGET_WALLETS, SPECIAL_TARGET_WALLET_BOUGHT};
+use std::collections::{HashMap, HashSet};
 
 // Global state for copy trading - simplified to only track statistics
 lazy_static::lazy_static! {
@@ -414,6 +414,23 @@ async fn handle_parsed_data(
             return Ok(());
         }
         let target_addr = maybe_target.unwrap();
+
+        // Special target wallet handling: one-time-per-mint buy
+        let is_special = {
+            let set = SPECIAL_TARGET_WALLETS.read().unwrap();
+            set.contains(&target_addr)
+        };
+        if is_special {
+            // Check and record
+            let mut bought_map = SPECIAL_TARGET_WALLET_BOUGHT.write().unwrap();
+            let entry = bought_map.entry(target_addr.clone()).or_insert_with(HashSet::new);
+            if entry.contains(&mint) {
+                logger.log(format!("Special target {} already bought {}, skipping buy", target_addr, mint).yellow().to_string());
+                return Ok(());
+            } else {
+                entry.insert(mint.clone());
+            }
+        }
 
         // Compute target amounts and our copy amounts
         let target_sol = parsed_data.sol_change.abs();

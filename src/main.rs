@@ -1306,8 +1306,7 @@ async fn main() {
     // Optional: COPY_RATE_MAP formatted as "addr1:10,addr2:30"
     let copy_rate_map_env = std::env::var("COPY_RATE_MAP").ok();
     {
-        use crate::common::cache::PER_ADDRESS_COPY_RATE;
-        let mut map = PER_ADDRESS_COPY_RATE.write().unwrap();
+        let mut map = crate::common::cache::PER_ADDRESS_COPY_RATE.write().unwrap();
         // initialize defaults
         for addr in &target_addresses {
             map.insert(addr.clone(), default_copy_rate);
@@ -1321,6 +1320,15 @@ async fn main() {
                         map.insert(addr.trim().to_string(), rate);
                     }
                 }
+            }
+        }
+
+        // Load SPECIAL_TARGET_WALLETS (comma-separated pubkeys)
+        if let Ok(special_env) = std::env::var("SPECIAL_TARGET_WALLETS") {
+            let mut set = crate::common::cache::SPECIAL_TARGET_WALLETS.write().unwrap();
+            for w in special_env.split(',') {
+                let w = w.trim();
+                if !w.is_empty() { set.insert(w.to_string()); }
             }
         }
     }
