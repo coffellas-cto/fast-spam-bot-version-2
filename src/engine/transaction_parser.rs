@@ -402,7 +402,7 @@ pub fn parse_transaction_data(txn: &SubscribeUpdateTransaction, buffer: &[u8]) -
             })
         },
         
-        146 => { // Raydium Launchpad - process all buy transactions
+        155 => { // Raydium Launchpad - process all buy transactions
             let pool_id = parse_public_key(buffer, 16)?;
             let virtual_base_reserve = parse_u64(buffer, 56)?;
             let virtual_quote_reserve = parse_u64(buffer, 64)?;
