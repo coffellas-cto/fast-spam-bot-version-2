@@ -331,8 +331,8 @@ async fn process_message(
             let cpi_log_data = inner_instructions
                 .iter() 
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 155)
-                // .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 155)
+                // .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 155)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 155)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {
