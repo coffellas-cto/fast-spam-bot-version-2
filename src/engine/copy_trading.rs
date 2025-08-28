@@ -412,7 +412,7 @@ async fn handle_parsed_data(
         let maybe_target = signers.iter().find(|s| config.target_addresses.iter().any(|t| t == *s)).cloned();
         if maybe_target.is_none() {
             logger.log(format!("No matching target signer found for BUY {}, signers: {:?}", mint, signers).yellow().to_string());
-            return Ok(());
+            // return Ok(());  // enable this to skip buy if no matching signer 
         }
         let target_addr = maybe_target.unwrap();
 

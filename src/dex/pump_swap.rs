@@ -446,7 +446,7 @@ impl PumpSwap {
             trade_info.virtual_token_reserves,
         );
         
-        let min_quote_amount_out = 0;  // this ensures must sell
+        let min_quote_amount_out =10;  // this ensures must sell
         println!("Sell calculation - Tokens in: {}, Expected SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}", 
             amount, quote_amount_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves);
 
@@ -528,7 +528,7 @@ impl PumpSwap {
             trade_info.virtual_token_reserves,
         );
         
-        let min_quote_amount_out = 0;  // this ensures must sell
+        let min_quote_amount_out = 1;  // this ensures must sell
         println!("Sell calculation - Tokens in: {} (from cached balance: {}), Expected SOL out: {}, Virtual SOL: {}, Virtual Tokens: {}", 
             amount, balance_raw, quote_amount_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves);
         
