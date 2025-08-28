@@ -329,9 +329,10 @@ async fn process_message(
             let signers: Vec<String> = extract_signers_from_txn(txn);
             // Find inner instruction with data length of 368, 270, 266, or 146 (Raydium Launchpad)
             let cpi_log_data = inner_instructions
-                .iter()
+                .iter() 
                 .flat_map(|inner| &inner.instructions)
-                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 155)
+                .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 155)
+                // .find(|ix| ix.data.len() == 368 || ix.data.len() == 270 || ix.data.len() == 266 || ix.data.len() == 155)
                 .map(|ix| ix.data.clone());
 
             if let Some(data) = cpi_log_data {
